@@ -1,0 +1,231 @@
+/**
+ * Creepy Proximity Synth → Bluetooth Speaker (A2DP Source)
+ * Target: Raspberry Pi Pico W (Arduino-Pico core by Earle Philhower)
+ * Library:  #include <BluetoothAudio.h>  → A2DPSource
+ *
+ * Bluetooth usage pattern (same as the working A2DPSource example):
+ *   - bt.begin(); bt.setVolume(...); bt.connect("SPEAKER NAME");
+ *   - Synthesize 16-bit PCM (interleaved stereo) and Stream::write() bytes.
+ *   - The A2DP layer SBC-encodes and transmits in the background.  (Docs)  <-- READ
+ *     https://arduino-pico.readthedocs.io/en/latest/a2dp.html
+ *
+ * --------------------------------- WIRING ---------------------------------
+ * Ultrasonic (HC-SR04):
+ *   Vcc  → 5V  (use Pico W VBUS pin if USB-powered)
+ *   GND  → GND (common with Pico)
+ *   TRIG → Pico GP2  (3.3V output OK)
+ *   ECHO → Pico GP3  *** THROUGH a resistor divider to 3.3V ***
+ *           Example dividers: 10k (to ECHO) + 15k (to GND) → ~3.0V
+ *                             10k + 18k → ~3.2V (also fine)
+ * NOTE: HC-SR04 must be powered from 5V for reliable ranging.
+ *
+ * --------------------------------- BEHAVIOR ---------------------------------
+ * - Distance maps to:
+ *    • Carrier frequency ~300–900 Hz (closer ⇒ higher).
+ *    • Tremolo (AM) rate/depth.
+ *    • Vibrato (FM) rate/depth.
+ * - Two slow LFOs (AM + FM) plus the carrier. No overclocking needed.
+ *
+ * --------------------------------- TUNING ---------------------------------
+ * - FRAMES controls the size of each audio write. Use 1024..2048 to reduce jitter.
+ * - If you still hear buffer underruns, increase FRAMES or reduce math per sample.
+ */
+
+#include <Arduino.h>
+#include <BluetoothAudio.h>             // Arduino-Pico Bluetooth A2DP
+#include <math.h>
+
+// ---------------- Bluetooth A2DP Source ----------------
+A2DPSource bt;            // Stream-like interface
+static const uint8_t SPEAKER_ADDR[6] = {0xE8, 0xD0, 0x3C, 0x9B, 0x38, 0x39};
+
+// ---------------- Audio format & block sizing ----------------
+constexpr uint32_t SR        = 48000;   // 48 kHz is A2DP-friendly
+constexpr uint8_t  CHANNELS  = 2;       // interleaved stereo (duplicate mono)
+constexpr size_t   FRAMES    = 1024;    // try 1024, or 1536/2048 if you still hear jitter
+// 1024 frames @ 48k ≈ 21.3 ms of audio per write
+
+// ---------------- Sonar pins (HC-SR04) ----------------
+constexpr uint8_t PIN_TRIG   = 2;       // TRIG → GP2 (3.3V output)
+constexpr uint8_t PIN_ECHO   = 3;       // ECHO → GP3 via resistor divider to 3.3V
+constexpr uint32_t SONAR_PERIOD_MS  = 50;
+constexpr uint32_t SONAR_TIMEOUT_US = 14000; // ~2.4 m max
+static float g_lastDistanceCm = 120.0f;
+constexpr float NEAR_CM = 5.0;
+constexpr float FAR_CM = 100.0;
+
+
+// ---------------- Carrier + LFO ranges ----------------
+constexpr float FREQ_MIN_HZ       = 300.0f;
+constexpr float FREQ_MAX_HZ       = 900.0f;
+constexpr float LFO_AM_MIN_HZ     = 0.6f;   // tremolo rate min
+constexpr float LFO_AM_MAX_HZ     = 4.0f;   // tremolo rate max
+constexpr float LFO_FM_MIN_HZ     = 0.7f;   // vibrato rate min
+constexpr float LFO_FM_MAX_HZ     = 7.0f;   // vibrato rate max
+constexpr float VIBRATO_MIN_CENTS = 15.0f;   // vibrato depth
+constexpr float VIBRATO_MAX_CENTS = 80.0f;
+constexpr float TREMOLO_MIN_DEPTH = 0.10f;  // AM depth 0..1
+constexpr float TREMOLO_MAX_DEPTH = 0.90f;
+constexpr float MASTER_GAIN       = 0.70f;
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
+// ---------------- 256-sample sine LUT + linear interpolation ----------------
+constexpr int      LUT_BITS = 8;                 // 2^8 = 256 entries
+constexpr uint32_t LUT_LEN  = (1u << LUT_BITS);
+static int16_t     SINE_LUT[LUT_LEN];
+
+static inline uint32_t phaseIncFromHz(float f) {
+  // 32-bit phase accumulator: inc = f * 2^32 / SR
+  return (uint32_t)((double)f * (4294967296.0 / (double)SR));
+}
+
+static inline int16_t lutSineLerp(uint32_t phase) {
+  // High LUT_BITS → index, next 8 bits → fraction
+  const uint32_t idx  = phase >> (32 - LUT_BITS);
+  const uint32_t frac = (phase >> (32 - LUT_BITS - 8)) & 0xFF;
+  const int16_t  a = SINE_LUT[idx & (LUT_LEN - 1)];
+  const int16_t  b = SINE_LUT[(idx + 1) & (LUT_LEN - 1)];
+  const int32_t  d = (int32_t)b - (int32_t)a;
+  return (int16_t)(a + ((d * (int32_t)frac) >> 8));
+}
+
+struct Osc {
+  uint32_t phase = 0;
+  uint32_t inc   = 0;
+  inline int16_t next() { phase += inc; return lutSineLerp(phase); }
+};
+
+static Osc oscCar;   // carrier
+static Osc oscAM;    // tremolo LFO
+static Osc oscFM;    // vibrato LFO
+
+// ---------------- Distance mapping helpers ----------------
+static inline float clampf(float x, float a, float b) { return x < a ? a : (x > b ? b : x); }
+static inline float lerp(float a, float b, float t)   { return a + (b - a) * t; }
+
+static float proximity01FromDistance(float cm) {
+  float u = 1.0f - (cm - NEAR_CM) / (FAR_CM - NEAR_CM);
+  return clampf(u, 0.0f, 1.0f);
+}
+
+static inline uint32_t applyVibrato(uint32_t baseInc, float centsDepth, int16_t lfoS16) {
+  float lfo = (float)lfoS16 / 32767.0f;          // [-1,1]
+  float cents = centsDepth * lfo;
+  float ratio = powf(2.0f, cents / 1200.0f);     // cents → freq ratio
+  double newInc = (double)baseInc * (double)ratio;
+  if (newInc < 1.0) newInc = 1.0;
+  if (newInc > 4294967295.0) newInc = 4294967295.0;
+  return (uint32_t)newInc;
+}
+
+// ---------------- Non-critical sonar polling (tiny blocking) ----------------
+static uint32_t g_lastSonarMs = 0;
+static void pollSonar() {
+  const uint32_t now = millis();
+  if (now - g_lastSonarMs < SONAR_PERIOD_MS) return;
+  g_lastSonarMs = now;
+
+  digitalWrite(PIN_TRIG, LOW); delayMicroseconds(2);
+  digitalWrite(PIN_TRIG, HIGH); delayMicroseconds(10);
+  digitalWrite(PIN_TRIG, LOW);
+
+  unsigned long dur = pulseIn(PIN_ECHO, HIGH, SONAR_TIMEOUT_US); // µs
+  if (dur == 0) { g_lastDistanceCm = FAR_CM; return; }
+  g_lastDistanceCm = (float)dur / 58.0f;  // HC‑SR04: µs → cm
+  //Serial.printf("Distance: %.1f cm\n", g_lastDistanceCm);
+}
+
+// ---------------- Setup ----------------
+void setup() {
+  Serial.begin(115200);
+  while (!Serial) delay(10);  // Wait for serial monitor (optional)
+  Serial.printf("Starting the setup...\n");
+  // Sine LUT
+  for (uint32_t i = 0; i < LUT_LEN; ++i) {
+    double th = (2.0 * M_PI * i) / (double)LUT_LEN;
+    SINE_LUT[i] = (int16_t)lrint(32767.0 * sin(th));
+  }
+
+  // Sonar pins
+  pinMode(PIN_TRIG, OUTPUT);
+  pinMode(PIN_ECHO, INPUT);  // *** Must feed through resistor divider from 5V Echo ***
+
+  // Bluetooth A2DP Source (follows the example pattern)
+  bt.begin();
+  bt.connect(SPEAKER_ADDR);
+
+  // Initial osc increments (will be updated every buffer)
+  oscCar.inc = phaseIncFromHz(440.0f);
+  oscAM.inc  = phaseIncFromHz(1.0f);
+  oscFM.inc  = phaseIncFromHz(2.0f);
+}
+
+// ---------------- Main loop ----------------
+void loop() {
+  // Try to (re)connect every few seconds if not connected
+  static uint32_t lastConnectTry = 0;
+  if (!bt.connected()) {
+    uint32_t now = millis();
+    if (now - lastConnectTry > 3000) {
+      Serial.printf("Trying to connect Bluetooth.\n");
+      bt.connect(SPEAKER_ADDR);
+      lastConnectTry = now;
+    }
+    delay(10);
+    return; // don’t generate audio if there’s nowhere to send it
+  }
+
+  // Update sonar between audio buffers (short block)
+  pollSonar();
+
+  // Map distance → all synth params
+  float prox   = proximity01FromDistance(g_lastDistanceCm);
+  float f_car  = lerp(FREQ_MIN_HZ, FREQ_MAX_HZ, prox);
+  float f_am   = lerp(LFO_AM_MIN_HZ, LFO_AM_MAX_HZ, prox);
+  float f_fm   = lerp(LFO_FM_MIN_HZ, LFO_FM_MAX_HZ, prox);
+  float tremDepth     = lerp(TREMOLO_MIN_DEPTH, TREMOLO_MAX_DEPTH, prox);   // 0..1
+  float vibratoCents  = lerp(VIBRATO_MIN_CENTS, VIBRATO_MAX_CENTS, prox);
+
+  const uint32_t carBaseInc = phaseIncFromHz(f_car);
+  oscAM.inc = phaseIncFromHz(f_am);
+  oscFM.inc = phaseIncFromHz(f_fm);
+
+  // Synthesize one block (mono duplicated to stereo)
+  static int16_t buf[FRAMES * CHANNELS];
+  for (size_t i = 0; i < FRAMES; ++i) {
+    int16_t am_s = oscAM.next();                     // AM LFO
+    int16_t fm_s = oscFM.next();                     // FM LFO
+
+    // Per-sample vibrato: adjust carrier phase increment by small ratio
+    oscCar.inc = applyVibrato(carBaseInc, vibratoCents, fm_s);
+
+    // Raw carrier [-1,1]
+    float car = (float)oscCar.next() / 32767.0f;
+
+    // Tremolo depth shaping (0..1), center at 1-depth then add LFO
+    float am = (float)am_s / 32767.0f;
+    float trem = (1.0f - tremDepth) + tremDepth * (0.5f * (am + 1.0f));
+
+    float out = MASTER_GAIN * trem * car;
+    if (out >  0.999f) out =  0.999f;    // soft limit
+    if (out < -0.999f) out = -0.999f;
+
+    int16_t s = (int16_t)lrintf(out * 32767.0f);
+    buf[2*i + 0] = s;  // Left
+    buf[2*i + 1] = s;  // Right
+  }
+
+  // Write the entire block to the A2DP Source stream (handle partial writes)
+  size_t nbytes = sizeof(buf);
+  const uint8_t* p = reinterpret_cast<const uint8_t*>(buf);
+  while (nbytes) {
+    int w = bt.write(p, nbytes);     // same Stream::write() pattern as the example
+    if (w > 0) { p += w; nbytes -= w; }
+    else       { delay(1); }         // brief yield if the TX buffer is momentarily full
+  }
+
+  // Loop back; sonar is pinged again before the next block.
+}
