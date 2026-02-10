@@ -12,12 +12,22 @@ Arduino CLI projects for Raspberry Pi Pico boards.
 Use the helper script:
 
 ```bash
-./scripts/build.sh all
-./scripts/build.sh creepy_halloween_sonar
-./scripts/build.sh pico2w_lcd_soundboard
+./scripts/build.sh
+./pico2w_lcd_soundboard/build.sh
 ```
 
 Build outputs are written to `.build/<project-name>/`.
+
+## Preset Lab
+
+For laptop-side preset tuning with immediate audio feedback:
+
+```bash
+cd tools/preset_lab
+python3 -m http.server 8080
+```
+
+Then open `http://localhost:8080`.
 
 ## Requirements
 
