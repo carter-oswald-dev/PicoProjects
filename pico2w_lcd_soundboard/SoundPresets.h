@@ -3,7 +3,7 @@
 #include <Arduino.h>
 
 constexpr uint8_t PRESET_OSC_COUNT = 4;
-constexpr uint8_t PRESET_COUNT = 4;
+constexpr uint8_t PRESET_COUNT = 5;
 
 // Oscillator source type used by each oscillator slot.
 enum SourceType : uint8_t { SRC_SINE = 0, SRC_NOISE = 1 };
@@ -116,6 +116,23 @@ static const SoundPreset kSoundPresets[PRESET_COUNT] = {
       {SRC_SINE, 110.0f, 55.0f, 0.40f, 0.20f, 0.0f, 0.0f},
       {SRC_SINE, 3200.0f, 650.0f, 0.42f, 0.10f, 0.0f, 0.0f},
       {SRC_SINE, 190.0f, 85.0f, 0.26f, 0.16f, 0.0f, 0.0f},
+    }
+  },
+  {
+    "Wolf whistle",
+    0.85f,
+    0.010f,
+    0.20f,
+    1.0f,
+    0.70f,
+    {0.45f, 0.95f},
+    {5.5f, 35.0f, 0.05f},
+    {1, 0.0f, 1.0f, 0.0f},
+    {
+      {SRC_SINE, 900.0f, 2800.0f, 0.55f, 0.45f, 0.0f, 0.0f},
+      {SRC_SINE, 1200.0f, 3600.0f, 0.22f, 0.20f, 0.0f, 0.0f},
+      {SRC_SINE, 450.0f, 1300.0f, 0.18f, 0.12f, 0.0f, 0.0f},
+      {SRC_NOISE, 0.0f, 0.0f, 0.03f, 0.00f, 2000.0f, 10000.0f},
     }
   },
 };

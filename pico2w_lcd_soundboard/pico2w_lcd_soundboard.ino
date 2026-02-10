@@ -4,11 +4,6 @@
  * Target: Raspberry Pi Pico 2W (Arduino-Pico core by Earle Philhower)
  * Audio:  A2DP Source via BluetoothAudio.h (streams synthesized audio)
  * Display: Initialized through LcdDriver.c/.h (from PicoLcdGenerativeArt)
- *
- * Notes:
- * - Update SPEAKER_ADDR to your Bluetooth speaker's MAC address.
- * - Install library: "BluetoothAudio".
- * - LCD/button pin mapping comes from LcdDriver.h.
  */
 
 #include <Arduino.h>
@@ -16,6 +11,7 @@
 #include <math.h>
 #include "LcdDriver.h"
 #include "SoundPresets.h"
+#include "UiText.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -25,13 +21,24 @@ struct ButtonState;
 
 // ---------------- Bluetooth A2DP Source ----------------
 A2DPSource bt;
-// REPLACE with your speaker's MAC address:
 static const uint8_t SPEAKER_ADDR[6] = {0xE8, 0xD0, 0x3C, 0x9B, 0x38, 0x39};
 
 // ---------------- Audio format & block sizing ----------------
 constexpr uint32_t SR       = 48000;   // A2DP-friendly
 constexpr uint8_t  CHANNELS = 2;       // interleaved stereo (mono duplicated)
 constexpr size_t   FRAMES   = 512;     // ~10.7 ms @ 48k
+constexpr uint8_t  SOUND_VIEW_SLOTS = 4;
+constexpr uint32_t BT_RECONNECT_MS = 3000;
+
+static uint8_t  g_presetWindowStart = 0;
+static uint32_t g_lastReconnectAttemptMs = 0;
+
+static volatile bool g_audioPlaying = false;
+static volatile uint8_t g_audioSoundId = 0;
+static volatile bool g_streamEnabled = true;
+static volatile bool g_btConnected = false;
+static volatile bool g_btReady = false;
+static volatile bool g_btStateChanged = false;
 
 // ---------------- Small sine LUT + linear interpolation ----------------
 constexpr int      LUT_BITS = 10;             // 1024 entries
@@ -57,7 +64,7 @@ struct Osc {
   inline void reset() { phase = 0; }
 };
 
-// ---------------- Synth state ----------------
+// ---------------- Synth state (core1 only) ----------------
 struct SynthState {
   uint8_t  soundId    = 0;
   bool     playing    = false;
@@ -76,6 +83,9 @@ static SynthState g_synth;
 // ---------------- Helpers ----------------
 static inline float clampf(float x, float a, float b) { return x < a ? a : (x > b ? b : x); }
 static inline float lerp(float a, float b, float t)   { return a + (b - a) * t; }
+static inline uint8_t slotToPreset(uint8_t slot) {
+  return (uint8_t)((g_presetWindowStart + slot) % PRESET_COUNT);
+}
 static inline float onePoleAlpha(float fc) {
   return clampf((2.0f * (float)M_PI * fc) / (float)SR, 0.0f, 1.0f);
 }
@@ -229,8 +239,67 @@ static float synthSample() {
   }
 
   g_synth.burstSamplePos++;
-
   return ampBase * ampLfo * repeatGain * mix;
+}
+
+// ---------------- Audio command channel (core0 -> core1) ----------------
+enum AudioCmdType : uint8_t {
+  CMD_NONE = 0,
+  CMD_TRIGGER_SOUND = 1,
+  CMD_STOP_SOUND = 2,
+  CMD_STREAM_ENABLE = 3,
+};
+
+static inline uint32_t packAudioCmd(uint8_t cmd, uint8_t arg) {
+  return ((uint32_t)cmd << 24) | (uint32_t)arg;
+}
+
+static inline uint8_t unpackAudioCmdType(uint32_t raw) {
+  return (uint8_t)((raw >> 24) & 0xFFu);
+}
+
+static inline uint8_t unpackAudioCmdArg(uint32_t raw) {
+  return (uint8_t)(raw & 0xFFu);
+}
+
+static bool sendAudioCmd(uint8_t cmd, uint8_t arg = 0) {
+  const uint32_t packed = packAudioCmd(cmd, arg);
+  for (int i = 0; i < 200; ++i) {
+    if (rp2040.fifo.push_nb(packed)) {
+      return true;
+    }
+    delayMicroseconds(50);
+  }
+  return false;
+}
+
+static void handleAudioCmd(uint32_t raw) {
+  const uint8_t cmd = unpackAudioCmdType(raw);
+  const uint8_t arg = unpackAudioCmdArg(raw);
+
+  switch (cmd) {
+    case CMD_TRIGGER_SOUND:
+      triggerSound(arg);
+      break;
+    case CMD_STOP_SOUND:
+      g_synth.playing = false;
+      break;
+    case CMD_STREAM_ENABLE:
+      g_streamEnabled = (arg != 0);
+      if (!g_streamEnabled) {
+        g_synth.playing = false;
+      }
+      break;
+    default:
+      break;
+  }
+}
+
+static void processAudioCmdQueue() {
+  uint32_t raw = 0;
+  while (rp2040.fifo.pop_nb(&raw)) {
+    handleAudioCmd(raw);
+  }
 }
 
 // ---------------- Button handling ----------------
@@ -242,6 +311,7 @@ struct ButtonState {
 
 constexpr uint32_t DEBOUNCE_MS = 25;
 static ButtonState btnA{LCD_KEY_A}, btnB{LCD_KEY_B}, btnX{LCD_KEY_X}, btnY{LCD_KEY_Y};
+static ButtonState btnUp{LCD_KEY_UP}, btnDown{LCD_KEY_DOWN};
 
 static void initButtons() {
   // Pins and pull-ups are configured by LcdModuleInit().
@@ -249,6 +319,8 @@ static void initButtons() {
   btnB.last = LcdGetKey(btnB.pin);
   btnX.last = LcdGetKey(btnX.pin);
   btnY.last = LcdGetKey(btnY.pin);
+  btnUp.last = LcdGetKey(btnUp.pin);
+  btnDown.last = LcdGetKey(btnDown.pin);
 }
 
 static bool buttonPressed(ButtonState &b) {
@@ -274,7 +346,92 @@ static void lcdInit() {
   }
 }
 
-// ---------------- Arduino Setup ----------------
+// ---------------- UI rendering ----------------
+static uint8_t g_lastUiWindowStart = 0xFF;
+static int8_t g_lastUiActiveRow = -2;
+static uint8_t g_lastUiBtConnected = 0xFF;
+
+static int8_t currentActiveSlot() {
+  if (!g_audioPlaying || g_audioSoundId >= PRESET_COUNT) return -1;
+  for (uint8_t slot = 0; slot < SOUND_VIEW_SLOTS; ++slot) {
+    if (slotToPreset(slot) == g_audioSoundId) return (int8_t)slot;
+  }
+  return -1;
+}
+
+static void renderSoundboardUi(bool force) {
+  if (g_lcdFrameBuffer == nullptr) return;
+
+  const int8_t activeSlot = currentActiveSlot();
+  const uint8_t btConn = g_btConnected ? 1u : 0u;
+  if (!force &&
+      g_lastUiWindowStart == g_presetWindowStart &&
+      g_lastUiActiveRow == activeSlot &&
+      g_lastUiBtConnected == btConn) {
+    return;
+  }
+
+  const int screenW = SCREEN_WIDTH_HEIGHT;
+  const int screenH = SCREEN_WIDTH_HEIGHT;
+  const int rightX = 84;
+  const int rightW = screenW - rightX;
+  const int rowH = screenH / SOUND_VIEW_SLOTS;
+  static const char kSlotLabel[SOUND_VIEW_SLOTS] = {'A', 'B', 'X', 'Y'};
+
+  UiClear(0x0000);
+  UiFillRect(rightX, 0, rightW, screenH, 0x18C3);
+  UiDrawText(6, 8, "SOUNDBOARD", 0xFFFF, 0x0000);
+
+  char rangeText[24];
+  const uint8_t rangeStart = (uint8_t)(g_presetWindowStart + 1);
+  const uint8_t rangeEnd =
+      (uint8_t)(((g_presetWindowStart + SOUND_VIEW_SLOTS - 1) % PRESET_COUNT) + 1);
+  snprintf(rangeText, sizeof(rangeText), "%u-%u / %u",
+           (unsigned)rangeStart, (unsigned)rangeEnd, (unsigned)PRESET_COUNT);
+  UiDrawText(6, 22, rangeText, 0xFFE0, 0x0000);
+  UiDrawText(6, 40, "UP/DN SCROLL", 0xC618, 0x0000);
+  UiDrawText(6, 54, "A/B/X/Y PLAY", 0xC618, 0x0000);
+  UiDrawText(6, 68, btConn ? "BT: CONNECTED" : "BT: DISCONNECTED",
+             btConn ? 0x07E0 : 0xF800, 0x0000);
+
+  if (g_audioPlaying && g_audioSoundId < PRESET_COUNT) {
+    char nowText[32];
+    snprintf(nowText, sizeof(nowText), "NOW: %s", kSoundPresets[g_audioSoundId].name);
+    UiDrawTextClipped(6, 86, 13, nowText, 0xFFFF, 0x0000);
+  }
+
+  for (uint8_t row = 0; row < SOUND_VIEW_SLOTS; ++row) {
+    const int y = (int)row * rowH;
+    const uint8_t presetIdx = slotToPreset(row);
+    const bool isActive = ((int8_t)row == activeSlot);
+
+    const uint16_t rowBg = isActive ? 0x07E0 : 0x2104;
+    const uint16_t rowFg = isActive ? 0x0000 : 0xFFFF;
+
+    UiFillRect(rightX + 1, y + 1, rightW - 2, rowH - 2, rowBg);
+    UiDrawRect(rightX, y, rightW, rowH, 0x4A69);
+
+    char keyText[2] = {kSlotLabel[row], '\0'};
+    char idxText[8];
+    snprintf(idxText, sizeof(idxText), "#%u", (unsigned)(presetIdx + 1));
+
+    UiDrawText(rightX + 6, y + 8, keyText, rowFg, rowBg);
+    UiDrawText(rightX + 6, y + 22, idxText, rowFg, rowBg);
+    UiDrawTextClipped(rightX + 36, y + 18, 18, kSoundPresets[presetIdx].name, rowFg, rowBg);
+  }
+
+  LcdWriteToScreen();
+  g_lastUiWindowStart = g_presetWindowStart;
+  g_lastUiActiveRow = activeSlot;
+  g_lastUiBtConnected = btConn;
+}
+
+static void onBtConnect(void*, bool connected) {
+  g_btConnected = connected;
+  g_btStateChanged = true;
+}
+
+// ---------------- Arduino Setup (core0) ----------------
 void setup() {
   Serial.begin(115200);
 
@@ -286,17 +443,42 @@ void setup() {
 
   lcdInit();
   initButtons();
+  if (g_lcdFrameBuffer != nullptr) {
+    UiInit(g_lcdFrameBuffer, SCREEN_WIDTH_HEIGHT, SCREEN_WIDTH_HEIGHT);
+  }
 
+  bt.onConnect(onBtConnect, nullptr);
   bt.begin();
+  g_btReady = true;
   bt.connect(SPEAKER_ADDR);
+  g_lastReconnectAttemptMs = millis();
+
+  sendAudioCmd(CMD_STREAM_ENABLE, 1);
+  renderSoundboardUi(true);
 }
 
-// ---------------- Arduino Loop ----------------
-void loop() {
-  if (buttonPressed(btnA)) triggerSound(0);
-  if (buttonPressed(btnB)) triggerSound(1);
-  if (buttonPressed(btnX)) triggerSound(2);
-  if (buttonPressed(btnY)) triggerSound(3);
+// ---------------- Core1 audio worker ----------------
+void setup1() {
+  // Audio worker core; initialization is handled in setup().
+}
+
+void loop1() {
+  processAudioCmdQueue();
+
+  if (!g_btReady) {
+    delay(1);
+    return;
+  }
+
+  if (!g_streamEnabled || !g_btConnected) {
+    if (!g_btConnected) {
+      g_synth.playing = false;
+    }
+    g_audioPlaying = false;
+    g_audioSoundId = g_synth.soundId;
+    delay(1);
+    return;
+  }
 
   static int16_t buf[FRAMES * CHANNELS];
 
@@ -314,12 +496,55 @@ void loop() {
     buf[2 * i + 1] = s;
   }
 
-  // Stream to A2DP
   size_t nbytes = sizeof(buf);
   const uint8_t* p = reinterpret_cast<const uint8_t*>(buf);
-  while (nbytes) {
+  while (nbytes && g_streamEnabled && g_btConnected) {
     int w = bt.write(p, nbytes);
-    if (w > 0) { p += w; nbytes -= w; }
-    else       { delay(1); }
+    if (w > 0) {
+      p += w;
+      nbytes -= (size_t)w;
+    } else {
+      processAudioCmdQueue();
+      delay(1);
+    }
   }
+
+  g_audioPlaying = g_synth.playing;
+  g_audioSoundId = g_synth.soundId;
+}
+
+// ---------------- Arduino Loop (core0) ----------------
+void loop() {
+  bool uiDirty = false;
+
+  if (g_btStateChanged) {
+    g_btStateChanged = false;
+    uiDirty = true;
+  }
+
+  if (g_btReady && !g_btConnected) {
+    const uint32_t now = millis();
+    if ((now - g_lastReconnectAttemptMs) >= BT_RECONNECT_MS) {
+      g_lastReconnectAttemptMs = now;
+      bt.connect(SPEAKER_ADDR);
+      uiDirty = true;
+    }
+  }
+
+  if (buttonPressed(btnUp)) {
+    g_presetWindowStart = (uint8_t)((g_presetWindowStart + PRESET_COUNT - 1) % PRESET_COUNT);
+    uiDirty = true;
+  }
+  if (buttonPressed(btnDown)) {
+    g_presetWindowStart = (uint8_t)((g_presetWindowStart + 1) % PRESET_COUNT);
+    uiDirty = true;
+  }
+
+  if (buttonPressed(btnA)) { sendAudioCmd(CMD_TRIGGER_SOUND, slotToPreset(0)); uiDirty = true; }
+  if (buttonPressed(btnB)) { sendAudioCmd(CMD_TRIGGER_SOUND, slotToPreset(1)); uiDirty = true; }
+  if (buttonPressed(btnX)) { sendAudioCmd(CMD_TRIGGER_SOUND, slotToPreset(2)); uiDirty = true; }
+  if (buttonPressed(btnY)) { sendAudioCmd(CMD_TRIGGER_SOUND, slotToPreset(3)); uiDirty = true; }
+
+  renderSoundboardUi(uiDirty);
+  delay(1);
 }
