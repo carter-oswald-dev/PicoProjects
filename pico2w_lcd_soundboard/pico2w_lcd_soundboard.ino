@@ -15,6 +15,7 @@
 #include <BluetoothAudio.h>
 #include <math.h>
 #include "LcdDriver.h"
+#include "SoundPresets.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -61,8 +62,7 @@ struct SynthState {
   uint8_t  soundId    = 0;
   bool     playing    = false;
   uint32_t samplePos  = 0;
-  float    duration_s = 0.0f;
-  Osc      o1, o2, o3;
+  Osc      o[PRESET_OSC_COUNT];
 };
 
 static SynthState g_synth;
@@ -80,84 +80,47 @@ static float envAR(float t, float dur, float attack, float release) {
 }
 
 static void triggerSound(uint8_t id) {
+  if (id >= PRESET_COUNT) return;
   g_synth.soundId   = id;
   g_synth.playing   = true;
   g_synth.samplePos = 0;
-  g_synth.o1.reset();
-  g_synth.o2.reset();
-  g_synth.o3.reset();
+  for (uint8_t i = 0; i < PRESET_OSC_COUNT; ++i) {
+    g_synth.o[i].reset();
+  }
 }
 
 static float synthSample() {
   if (!g_synth.playing) return 0.0f;
 
-  float t = (float)g_synth.samplePos / (float)SR;
-  float u = 0.0f;
-  float f1 = 0.0f, f2 = 0.0f, f3 = 0.0f;
-  float m1 = 0.0f, m2 = 0.0f, m3 = 0.0f;
-  float amp = 0.0f;
-
-  switch (g_synth.soundId) {
-    case 0: { // "Bird Fart"
-      g_synth.duration_s = 1.0f;
-      u = clampf(t / g_synth.duration_s, 0.0f, 1.0f);
-      float up = (u < 0.20f) ? (u / 0.20f) : 1.0f;
-      float dn = (u < 0.20f) ? 0.0f : ((u - 0.20f) / 0.80f);
-      f1 = lerp(900.0f, 2400.0f, up);
-      f1 = lerp(f1, 600.0f, dn);
-      f2 = lerp(220.0f, 90.0f, u);
-      f3 = lerp(520.0f, 260.0f, u);
-      m1 = 0.55f; m2 = 0.30f; m3 = 0.20f;
-      amp = envAR(t, g_synth.duration_s, 0.02f, 0.35f) * (1.0f - 0.15f * u);
-    } break;
-
-    case 1: { // "Alien Goose"
-      g_synth.duration_s = 1.3f;
-      u = clampf(t / g_synth.duration_s, 0.0f, 1.0f);
-      f1 = 280.0f;
-      f2 = lerp(520.0f, 430.0f, u);
-      f3 = 820.0f;
-      m1 = 0.55f; m2 = 0.30f; m3 = 0.15f;
-      amp = envAR(t, g_synth.duration_s, 0.03f, 0.40f) * (0.85f - 0.25f * u);
-    } break;
-
-    case 2: { // "Laser Pew"
-      g_synth.duration_s = 0.6f;
-      u = clampf(t / g_synth.duration_s, 0.0f, 1.0f);
-      f1 = lerp(2000.0f, 220.0f, u);
-      f2 = lerp(1200.0f, 160.0f, u);
-      f3 = lerp(700.0f, 120.0f, u);
-      m1 = 0.60f; m2 = 0.30f; m3 = 0.10f;
-      amp = envAR(t, g_synth.duration_s, 0.01f, 0.18f);
-    } break;
-
-    default: { // case 3: "Bubble Pop"
-      g_synth.duration_s = 0.9f;
-      u = clampf(t / g_synth.duration_s, 0.0f, 1.0f);
-      f1 = lerp(300.0f, 900.0f, u);
-      f2 = lerp(900.0f, 360.0f, u);
-      f3 = lerp(1400.0f, 650.0f, u);
-      m1 = 0.50f; m2 = 0.30f; m3 = 0.20f;
-      amp = envAR(t, g_synth.duration_s, 0.02f, 0.30f) * (0.90f - 0.20f * u);
-    } break;
-  }
-
-  if (t >= g_synth.duration_s) {
+  if (g_synth.soundId >= PRESET_COUNT) {
     g_synth.playing = false;
     return 0.0f;
   }
 
-  uint32_t inc1 = phaseIncFromHz(f1);
-  uint32_t inc2 = phaseIncFromHz(f2);
-  uint32_t inc3 = phaseIncFromHz(f3);
+  const SoundPreset& p = kSoundPresets[g_synth.soundId];
+  float t = (float)g_synth.samplePos / (float)SR;
 
-  float s1 = (float)g_synth.o1.next(inc1) / 32767.0f;
-  float s2 = (float)g_synth.o2.next(inc2) / 32767.0f;
-  float s3 = (float)g_synth.o3.next(inc3) / 32767.0f;
+  if (p.duration_s <= 0.0f || t >= p.duration_s) {
+    g_synth.playing = false;
+    return 0.0f;
+  }
+
+  float u = clampf(t / p.duration_s, 0.0f, 1.0f);
+  float amp = envAR(t, p.duration_s, p.attack_s, p.release_s) *
+              lerp(p.loudness_start, p.loudness_end, u);
+  float mix = 0.0f;
+
+  for (uint8_t i = 0; i < PRESET_OSC_COUNT; ++i) {
+    const OscPreset& o = p.osc[i];
+    float f = lerp(o.freq_start_hz, o.freq_end_hz, u);
+    float m = lerp(o.mix_start, o.mix_end, u);
+    uint32_t inc = phaseIncFromHz(f);
+    float s = (float)g_synth.o[i].next(inc) / 32767.0f;
+    mix += m * s;
+  }
 
   g_synth.samplePos++;
 
-  float mix = (m1 * s1) + (m2 * s2) + (m3 * s3);
   return amp * mix;
 }
 
