@@ -7,7 +7,11 @@
  */
 
 #include <Arduino.h>
+#define private public
 #include <BluetoothAudio.h>
+#undef private
+#include <BluetoothHCI.h>
+#include "classic/avrcp_controller.h"
 #include <math.h>
 #include <string.h>
 #include "LcdDriver.h"
@@ -31,6 +35,10 @@ constexpr uint32_t SR       = 48000;   // A2DP-friendly
 constexpr uint8_t  CHANNELS = 2;       // interleaved stereo (mono duplicated)
 constexpr uint8_t  SOUND_VIEW_SLOTS = 4;
 constexpr uint32_t BT_RECONNECT_MS = 3000;
+constexpr uint32_t BT_CONNECT_TIMEOUT_MS = 2500;
+constexpr uint8_t  SPEAKER_VOL_DEFAULT_PCT = 100;
+constexpr uint8_t  SPEAKER_VOL_STEP_PCT = 5;
+constexpr uint32_t SPEAKER_VOL_RETRY_MS = 250;
 constexpr size_t   AUDIO_RING_BYTES = 262144; // 256 KiB
 constexpr size_t   AUDIO_RING_SAMPLES = AUDIO_RING_BYTES / sizeof(int16_t);
 constexpr size_t   AUDIO_RING_CAP_FRAMES = AUDIO_RING_SAMPLES / CHANNELS;
@@ -62,12 +70,27 @@ static volatile bool g_streamEnabled = true;
 static volatile bool g_btConnected = false;
 static volatile bool g_btReady = false;
 static volatile bool g_btStateChanged = false;
+static volatile uint8_t g_speakerVolPct = SPEAKER_VOL_DEFAULT_PCT;
+static volatile bool g_speakerVolPending = true;
+static volatile bool g_speakerVolChanged = true;
+static uint32_t g_lastSpeakerVolTryMs = 0;
 
 constexpr uint32_t UI_PENDING_SOUND_MS = 250;
 static bool g_pendingUiActive = false;
 static uint8_t g_pendingUiSoundId = 0;
 static uint32_t g_pendingUiMs = 0;
 static uint16_t g_lastUiObservedSeq = 0;
+static uint8_t g_lastUiVolPct = 0xFF;
+static uint8_t g_lastUiVolPending = 0xFF;
+
+enum BtConnectStage : uint8_t {
+  BT_STAGE_IDLE = 0,
+  BT_STAGE_WAIT_DEFAULT,
+  BT_STAGE_WAIT_FALLBACK,
+};
+
+static BtConnectStage g_btConnectStage = BT_STAGE_IDLE;
+static uint32_t g_btStageStartMs = 0;
 
 // ---------------- Core1 audio ring buffer ----------------
 static int16_t g_audioRing[AUDIO_RING_SAMPLES];
@@ -205,6 +228,31 @@ static inline float onePoleAlpha(float fc) {
 }
 static inline float semitoneRatio(float semitones) {
   return exp2f(semitones / 12.0f);
+}
+
+static inline uint8_t clampVolumePctInt(int v) {
+  if (v < 0) return 0;
+  if (v > 100) return 100;
+  return (uint8_t)v;
+}
+
+static bool setSpeakerVolumePct(uint8_t pct) {
+  if (!g_btConnected) return false;
+  const uint16_t avrcpCid = bt.media_tracker.avrcp_cid;
+  if (avrcpCid == 0u) return false;
+  const uint8_t absVol = (uint8_t)(((uint16_t)pct * 127u + 50u) / 100u);
+  const uint8_t status = avrcp_controller_set_absolute_volume(avrcpCid, absVol);
+  return status == ERROR_CODE_SUCCESS;
+}
+
+static void maybeApplySpeakerVolume(uint32_t nowMs) {
+  if (!g_speakerVolPending || !g_btConnected) return;
+  if ((nowMs - g_lastSpeakerVolTryMs) < SPEAKER_VOL_RETRY_MS) return;
+  g_lastSpeakerVolTryMs = nowMs;
+  if (setSpeakerVolumePct(g_speakerVolPct)) {
+    g_speakerVolPending = false;
+    g_speakerVolChanged = true;
+  }
 }
 
 static inline uint32_t ringFramesAvailable() {
@@ -621,6 +669,7 @@ struct ButtonState {
 constexpr uint32_t DEBOUNCE_MS = 25;
 static ButtonState btnA{LCD_KEY_A}, btnB{LCD_KEY_B}, btnX{LCD_KEY_X}, btnY{LCD_KEY_Y};
 static ButtonState btnUp{LCD_KEY_UP}, btnDown{LCD_KEY_DOWN};
+static ButtonState btnLeft{LCD_KEY_LEFT}, btnRight{LCD_KEY_RIGHT};
 
 static void initButtons() {
   // Pins and pull-ups are configured by LcdModuleInit().
@@ -630,6 +679,8 @@ static void initButtons() {
   btnY.last = LcdGetKey(btnY.pin);
   btnUp.last = LcdGetKey(btnUp.pin);
   btnDown.last = LcdGetKey(btnDown.pin);
+  btnLeft.last = LcdGetKey(btnLeft.pin);
+  btnRight.last = LcdGetKey(btnRight.pin);
 }
 
 static bool buttonPressed(ButtonState &b) {
@@ -716,10 +767,14 @@ static void renderSoundboardUi(bool force) {
   const int8_t activeSlot = currentActiveSlot(&activeSoundId);
   const bool hasActiveSound = (activeSoundId < PRESET_COUNT);
   const uint8_t btConn = g_btConnected ? 1u : 0u;
+  const uint8_t volPct = g_speakerVolPct;
+  const uint8_t volPending = g_speakerVolPending ? 1u : 0u;
   if (!force &&
       g_lastUiWindowStart == g_presetWindowStart &&
       g_lastUiActiveRow == activeSlot &&
-      g_lastUiBtConnected == btConn) {
+      g_lastUiBtConnected == btConn &&
+      g_lastUiVolPct == volPct &&
+      g_lastUiVolPending == volPending) {
     return;
   }
 
@@ -743,13 +798,19 @@ static void renderSoundboardUi(bool force) {
   UiDrawText(6, 22, rangeText, 0xFFE0, 0x0000);
   UiDrawText(6, 40, "UP/DN SCROLL", 0xC618, 0x0000);
   UiDrawText(6, 54, "A/B/X/Y PLAY", 0xC618, 0x0000);
-  UiDrawText(6, 68, btConn ? "BT: CONNECTED" : "BT: DISCONNECTED",
+  UiDrawText(6, 68, "L/R VOL", 0xC618, 0x0000);
+  UiDrawText(6, 82, btConn ? "BT: CONNECTED" : "BT: DISCONNECTED",
              btConn ? 0x07E0 : 0xF800, 0x0000);
+
+  char volText[20];
+  snprintf(volText, sizeof(volText), volPending ? "VOL: %u%%*" : "VOL: %u%%",
+           (unsigned)volPct);
+  UiDrawText(6, 96, volText, volPending ? 0xFFE0 : 0xFFFF, 0x0000);
 
   if (hasActiveSound) {
     char nowText[32];
     snprintf(nowText, sizeof(nowText), "NOW: %s", kSoundPresets[activeSoundId].name);
-    UiDrawTextClipped(6, 86, 13, nowText, 0xFFFF, 0x0000);
+    UiDrawTextClipped(6, 112, 13, nowText, 0xFFFF, 0x0000);
   }
 
   for (uint8_t row = 0; row < SOUND_VIEW_SLOTS; ++row) {
@@ -782,11 +843,75 @@ static void renderSoundboardUi(bool force) {
   g_lastUiWindowStart = g_presetWindowStart;
   g_lastUiActiveRow = activeSlot;
   g_lastUiBtConnected = btConn;
+  g_lastUiVolPct = volPct;
+  g_lastUiVolPending = volPending;
 }
 
 static void onBtConnect(void*, bool connected) {
   g_btConnected = connected;
+  g_btConnectStage = BT_STAGE_IDLE;
+  g_btStageStartMs = millis();
+  g_lastReconnectAttemptMs = g_btStageStartMs;
+  if (connected) {
+    g_speakerVolPending = true;
+    g_lastSpeakerVolTryMs = 0;
+  } else {
+    g_speakerVolPending = true;
+  }
+  g_speakerVolChanged = true;
   g_btStateChanged = true;
+}
+
+static void onBtVolume(void*, int pct) {
+  g_speakerVolPct = clampVolumePctInt(pct);
+  g_speakerVolPending = false;
+  g_speakerVolChanged = true;
+}
+
+static void startDefaultConnectAttempt(uint32_t nowMs) {
+  if (bt.connect(SPEAKER_ADDR)) {
+    g_btConnectStage = BT_STAGE_WAIT_DEFAULT;
+    g_btStageStartMs = nowMs;
+  } else {
+    g_btConnectStage = BT_STAGE_IDLE;
+    g_lastReconnectAttemptMs = nowMs;
+  }
+}
+
+static void startFallbackScan(uint32_t nowMs) {
+  auto devices = bt.scan(BluetoothHCI::speaker_cod, 5, false);
+  if (!devices.empty() && bt.connect(devices[0].address())) {
+    g_btConnectStage = BT_STAGE_WAIT_FALLBACK;
+    g_btStageStartMs = nowMs;
+  } else {
+    g_btConnectStage = BT_STAGE_IDLE;
+    g_lastReconnectAttemptMs = nowMs;
+  }
+}
+
+static void tickBluetoothConnectFallback(uint32_t nowMs) {
+  if (!g_btReady || g_btConnected) return;
+
+  switch (g_btConnectStage) {
+    case BT_STAGE_IDLE:
+      if ((nowMs - g_lastReconnectAttemptMs) >= BT_RECONNECT_MS) {
+        startDefaultConnectAttempt(nowMs);
+      }
+      break;
+
+    case BT_STAGE_WAIT_DEFAULT:
+      if ((nowMs - g_btStageStartMs) >= BT_CONNECT_TIMEOUT_MS) {
+        startFallbackScan(nowMs);
+      }
+      break;
+
+    case BT_STAGE_WAIT_FALLBACK:
+      if ((nowMs - g_btStageStartMs) >= BT_CONNECT_TIMEOUT_MS) {
+        g_btConnectStage = BT_STAGE_IDLE;
+        g_lastReconnectAttemptMs = nowMs;
+      }
+      break;
+  }
 }
 
 // ---------------- Arduino Setup (core0) ----------------
@@ -806,10 +931,11 @@ void setup() {
   }
 
   bt.onConnect(onBtConnect, nullptr);
+  bt.onVolume(onBtVolume, nullptr);
   bt.begin();
   g_btReady = true;
-  bt.connect(SPEAKER_ADDR);
   g_lastReconnectAttemptMs = millis();
+  startDefaultConnectAttempt(g_lastReconnectAttemptMs);
 
   sendAudioCmd(CMD_STREAM_ENABLE, 1);
   renderSoundboardUi(true);
@@ -918,13 +1044,16 @@ void loop() {
     uiDirty = true;
   }
 
+  if (g_speakerVolChanged) {
+    g_speakerVolChanged = false;
+    uiDirty = true;
+  }
+
   if (g_btReady && !g_btConnected) {
     const uint32_t now = millis();
-    if ((now - g_lastReconnectAttemptMs) >= BT_RECONNECT_MS) {
-      g_lastReconnectAttemptMs = now;
-      bt.connect(SPEAKER_ADDR);
-      uiDirty = true;
-    }
+    const BtConnectStage prevStage = g_btConnectStage;
+    tickBluetoothConnectFallback(now);
+    if (prevStage != g_btConnectStage) uiDirty = true;
   }
 
   if (buttonPressed(btnUp)) {
@@ -934,6 +1063,28 @@ void loop() {
   if (buttonPressed(btnDown)) {
     stepPresetWindow(true);
     uiDirty = true;
+  }
+
+  if (buttonPressed(btnLeft)) {
+    const uint8_t cur = g_speakerVolPct;
+    const uint8_t next = (cur > SPEAKER_VOL_STEP_PCT) ? (uint8_t)(cur - SPEAKER_VOL_STEP_PCT) : 0u;
+    if (next != cur) {
+      g_speakerVolPct = next;
+      g_speakerVolPending = true;
+      g_speakerVolChanged = true;
+      uiDirty = true;
+    }
+  }
+  if (buttonPressed(btnRight)) {
+    const uint8_t cur = g_speakerVolPct;
+    const uint8_t next = (cur >= (uint8_t)(100u - SPEAKER_VOL_STEP_PCT)) ? 100u
+                           : (uint8_t)(cur + SPEAKER_VOL_STEP_PCT);
+    if (next != cur) {
+      g_speakerVolPct = next;
+      g_speakerVolPending = true;
+      g_speakerVolChanged = true;
+      uiDirty = true;
+    }
   }
 
   if (buttonPressed(btnA)) {
@@ -971,6 +1122,10 @@ void loop() {
       g_pendingUiMs = millis();
       uiDirty = true;
     }
+  }
+
+  if (g_btReady) {
+    maybeApplySpeakerVolume(millis());
   }
 
   renderSoundboardUi(uiDirty);
