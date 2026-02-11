@@ -9,6 +9,7 @@
 #include <Arduino.h>
 #include <BluetoothAudio.h>
 #include <math.h>
+#include <string.h>
 #include "LcdDriver.h"
 #include "SoundPresets.h"
 #include "UiText.h"
@@ -19,6 +20,7 @@
 
 struct ButtonState;
 struct Osc;
+struct SynthRuntimeCache;
 
 // ---------------- Bluetooth A2DP Source ----------------
 A2DPSource bt;
@@ -27,9 +29,30 @@ static const uint8_t SPEAKER_ADDR[6] = {0xE8, 0xD0, 0x3C, 0x9B, 0x38, 0x39};
 // ---------------- Audio format & block sizing ----------------
 constexpr uint32_t SR       = 48000;   // A2DP-friendly
 constexpr uint8_t  CHANNELS = 2;       // interleaved stereo (mono duplicated)
-constexpr size_t   FRAMES   = 512;     // ~10.7 ms @ 48k
 constexpr uint8_t  SOUND_VIEW_SLOTS = 4;
 constexpr uint32_t BT_RECONNECT_MS = 3000;
+constexpr size_t   AUDIO_RING_BYTES = 262144; // 256 KiB
+constexpr size_t   AUDIO_RING_SAMPLES = AUDIO_RING_BYTES / sizeof(int16_t);
+constexpr size_t   AUDIO_RING_CAP_FRAMES = AUDIO_RING_SAMPLES / CHANNELS;
+constexpr size_t   AUDIO_RING_START_FRAMES = 2048;
+constexpr size_t   AUDIO_RING_LOW_FRAMES = 1024;
+constexpr size_t   AUDIO_RING_HIGH_FRAMES = 12288;
+constexpr size_t   AUDIO_SYNTH_BATCH_FRAMES = 512;
+constexpr size_t   AUDIO_TX_CHUNK_BYTES = 4096;
+constexpr size_t   AUDIO_TX_CHUNK_SAMPLES = AUDIO_TX_CHUNK_BYTES / sizeof(int16_t);
+
+static_assert(AUDIO_RING_SAMPLES % CHANNELS == 0, "Ring samples must align to stereo frames.");
+static_assert(AUDIO_RING_START_FRAMES <= AUDIO_RING_CAP_FRAMES,
+              "AUDIO_RING_START_FRAMES exceeds ring capacity.");
+static_assert(AUDIO_RING_LOW_FRAMES <= AUDIO_RING_CAP_FRAMES,
+              "AUDIO_RING_LOW_FRAMES exceeds ring capacity.");
+static_assert(AUDIO_RING_HIGH_FRAMES <= AUDIO_RING_CAP_FRAMES,
+              "AUDIO_RING_HIGH_FRAMES exceeds ring capacity.");
+static_assert(AUDIO_RING_LOW_FRAMES <= AUDIO_RING_HIGH_FRAMES,
+              "Low fill watermark must be <= high fill watermark.");
+static_assert(AUDIO_RING_START_FRAMES <= AUDIO_RING_HIGH_FRAMES,
+              "Start fill watermark must be <= high fill watermark.");
+static_assert(AUDIO_TX_CHUNK_SAMPLES % CHANNELS == 0, "Tx chunk must align to stereo frames.");
 
 static uint8_t  g_presetWindowStart = 0;
 static uint32_t g_lastReconnectAttemptMs = 0;
@@ -45,6 +68,13 @@ static bool g_pendingUiActive = false;
 static uint8_t g_pendingUiSoundId = 0;
 static uint32_t g_pendingUiMs = 0;
 static uint16_t g_lastUiObservedSeq = 0;
+
+// ---------------- Core1 audio ring buffer ----------------
+static int16_t g_audioRing[AUDIO_RING_SAMPLES];
+static uint32_t g_ringRead = 0;  // sample index
+static uint32_t g_ringWrite = 0; // sample index
+static uint32_t g_ringCount = 0; // sample count
+static bool g_ringStartPrimeActive = false;
 
 // ---------------- Small sine LUT + linear interpolation ----------------
 constexpr int      LUT_BITS = 10;             // 1024 entries
@@ -70,6 +100,49 @@ struct Osc {
   inline void reset() { phase = 0; }
 };
 
+struct OscRuntimeCache {
+  uint8_t source = SRC_SINE;
+  float mixStart = 0.0f;
+  float mixEnd = 0.0f;
+  float freqStart = 440.0f;
+  float freqEnd = 440.0f;
+  float slideStart = 0.0f;
+  float dutyStart = 0.5f;
+  float dutyEnd = 0.5f;
+  float dSlide = 0.0f;
+  float hpAlpha = 0.0f;
+  float lpAlpha = 0.0f;
+  bool hasHp = false;
+  bool hasLp = false;
+};
+
+struct SynthRuntimeCache {
+  float dur = 0.2f;
+  float attack = 0.0f;
+  float release = 0.0f;
+  float loudStart = 1.0f;
+  float loudEnd = 1.0f;
+  float shapeMidU = 0.5f;
+  float shapeMidGain = 1.0f;
+  uint8_t repeatCount = 1;
+  uint32_t gapSamples = 0;
+  float repeatDecay = 1.0f;
+  float repeatSemiStep = 0.0f;
+  float repeatGain = 1.0f;
+  float repeatSemi = 0.0f;
+  float lfoPitchCentsDepth = 0.0f;
+  float lfoAmpDepth = 0.0f;
+  uint32_t lfoPhaseInc = 0;
+  bool lfoEnabled = false;
+  float arpJumpTime = 0.0f;
+  float arpJumpSemi = 0.0f;
+  uint32_t retriggerSamples = 0;
+  float phaserMix = 0.0f;
+  float phaserDelayStartMs = 0.0f;
+  float phaserDelayEndMs = 0.0f;
+  OscRuntimeCache osc[PRESET_OSC_COUNT];
+};
+
 constexpr uint16_t PHASER_BUF_SIZE = 256;
 static_assert((PHASER_BUF_SIZE & (PHASER_BUF_SIZE - 1)) == 0,
               "PHASER_BUF_SIZE must be power-of-two");
@@ -93,6 +166,7 @@ struct SynthState {
   float    curDuty[PRESET_OSC_COUNT] = {0.5f};
   float    phaserBuf[PHASER_BUF_SIZE] = {0.0f};
   uint16_t phaserWrite = 0;
+  SynthRuntimeCache c;
   Osc      o[PRESET_OSC_COUNT];
 };
 
@@ -133,6 +207,48 @@ static inline float semitoneRatio(float semitones) {
   return exp2f(semitones / 12.0f);
 }
 
+static inline uint32_t ringFramesAvailable() {
+  return g_ringCount / CHANNELS;
+}
+
+static inline uint32_t ringFramesFree() {
+  return (uint32_t)AUDIO_RING_CAP_FRAMES - ringFramesAvailable();
+}
+
+static inline void ringClear() {
+  g_ringRead = 0;
+  g_ringWrite = 0;
+  g_ringCount = 0;
+}
+
+static inline bool ringPushStereoFrame(int16_t left, int16_t right) {
+  if ((g_ringCount + CHANNELS) > AUDIO_RING_SAMPLES) return false;
+  g_audioRing[g_ringWrite] = left;
+  g_ringWrite = (g_ringWrite + 1u) % AUDIO_RING_SAMPLES;
+  g_audioRing[g_ringWrite] = right;
+  g_ringWrite = (g_ringWrite + 1u) % AUDIO_RING_SAMPLES;
+  g_ringCount += CHANNELS;
+  return true;
+}
+
+static size_t ringPopSamples(int16_t* out, size_t maxSamples) {
+  if (maxSamples == 0 || g_ringCount == 0) return 0;
+  size_t samples = maxSamples;
+  if (samples > g_ringCount) samples = g_ringCount;
+  size_t first = samples;
+  const size_t toEnd = AUDIO_RING_SAMPLES - g_ringRead;
+  if (first > toEnd) first = toEnd;
+
+  memcpy(out, &g_audioRing[g_ringRead], first * sizeof(int16_t));
+  if (samples > first) {
+    memcpy(out + first, &g_audioRing[0], (samples - first) * sizeof(int16_t));
+  }
+
+  g_ringRead = (g_ringRead + (uint32_t)samples) % AUDIO_RING_SAMPLES;
+  g_ringCount -= (uint32_t)samples;
+  return samples;
+}
+
 static inline uint32_t xorshift32(uint32_t &s) {
   if (s == 0u) s = 0x6D2B79F5u;
   s ^= s << 13;
@@ -146,12 +262,10 @@ static inline float whiteNoise() {
   return ((float)r * (1.0f / 4294967295.0f)) * 2.0f - 1.0f;
 }
 
-static inline float twoStageShape(float u, float mid_u, float mid_gain) {
-  const float mu = safeClampf(mid_u, 0.01f, 0.99f, 0.5f);
-  const float mg = safeClampf(mid_gain, 0.0f, 1.0f, 1.0f);
+static inline float twoStageShapeClamped(float u, float mid_u, float mid_gain) {
   const float x = clampf(u, 0.0f, 1.0f);
-  if (x < mu) return lerp(1.0f, mg, x / mu);
-  return lerp(mg, 0.0f, (x - mu) / (1.0f - mu));
+  if (x < mid_u) return lerp(1.0f, mid_gain, x / mid_u);
+  return lerp(mid_gain, 0.0f, (x - mid_u) / (1.0f - mid_u));
 }
 
 static float envAR(float t, float dur, float attack, float release) {
@@ -179,11 +293,70 @@ static inline float oscWaveSample(Osc& osc, uint32_t inc, uint8_t source, float 
   }
 }
 
-static void resetBurstRuntime(const SoundPreset& p, bool resetPhaser, bool resetArp) {
+static void buildRuntimeCache(const SoundPreset& p) {
+  SynthRuntimeCache& c = g_synth.c;
+  c.dur = safeClampf(p.duration_s, 0.005f, 8.0f, 0.2f);
+  c.attack = safeClampf(p.attack_s, 0.0f, c.dur, 0.0f);
+  c.release = safeClampf(p.release_s, 0.0f, c.dur, 0.0f);
+  c.loudStart = safeClampf(p.loudness_start, 0.0f, 1.2f, 1.0f);
+  c.loudEnd = safeClampf(p.loudness_end, 0.0f, 1.2f, c.loudStart);
+  c.shapeMidU = safeClampf(p.shape.mid_u, 0.01f, 0.99f, 0.5f);
+  c.shapeMidGain = safeClampf(p.shape.mid_gain, 0.0f, 1.0f, 1.0f);
+  c.repeatCount = (uint8_t)safeClampf((float)p.repeat.count, 1.0f, 8.0f, 1.0f);
+  const float gapS = safeClampf(p.repeat.gap_s, 0.0f, 1.0f, 0.0f);
+  c.gapSamples = (uint32_t)lrintf(gapS * (float)SR);
+  c.repeatDecay = safeClampf(p.repeat.gain_decay_per_repeat, 0.0f, 1.0f, 1.0f);
+  c.repeatSemiStep = safeClampf(p.repeat.pitch_semitone_step, -24.0f, 24.0f, 0.0f);
+  c.repeatGain = 1.0f;
+  c.repeatSemi = 0.0f;
+  c.lfoPitchCentsDepth = safeClampf(p.lfo.pitch_cents_depth, 0.0f, 400.0f, 0.0f);
+  c.lfoAmpDepth = safeClampf(p.lfo.amp_depth, 0.0f, 1.0f, 0.0f);
+  const float lfoRateHz = safeClampf(p.lfo.rate_hz, 0.0f, 30.0f, 0.0f);
+  c.lfoEnabled = (lfoRateHz > 0.0f) &&
+                 (c.lfoPitchCentsDepth > 0.0f || c.lfoAmpDepth > 0.0f);
+  c.lfoPhaseInc = c.lfoEnabled ? phaseIncFromHz(lfoRateHz) : 0u;
+  c.arpJumpTime = safeClampf(p.arp.jump_time_s, 0.0f, c.dur, 0.0f);
+  c.arpJumpSemi = safeClampf(p.arp.jump_semitones, -24.0f, 24.0f, 0.0f);
+
   const float retrigInterval = safeClampf(p.retrigger.interval_s, 0.0f, 2.0f, 0.0f);
-  uint32_t retrigSamples = (uint32_t)lrintf(retrigInterval * (float)SR);
-  if (retrigInterval > 0.0f && retrigSamples == 0u) retrigSamples = 1u;
-  g_synth.retriggerSamples = retrigSamples;
+  c.retriggerSamples = (uint32_t)lrintf(retrigInterval * (float)SR);
+  if (retrigInterval > 0.0f && c.retriggerSamples == 0u) c.retriggerSamples = 1u;
+
+  const float maxDelayMs =
+      ((float)(PHASER_BUF_SIZE - 2) * 1000.0f) / (float)SR;
+  c.phaserMix = safeClampf(p.phaser.mix, 0.0f, 1.0f, 0.0f);
+  c.phaserDelayStartMs = safeClampf(p.phaser.delay_start_ms, 0.0f, maxDelayMs, 0.0f);
+  c.phaserDelayEndMs = safeClampf(p.phaser.delay_end_ms, 0.0f, maxDelayMs, c.phaserDelayStartMs);
+
+  for (uint8_t i = 0; i < PRESET_OSC_COUNT; ++i) {
+    const OscPreset& o = p.osc[i];
+    OscRuntimeCache& oc = c.osc[i];
+    oc.source = o.source;
+    oc.mixStart = safeClampf(o.mix_start, -2.0f, 2.0f, 0.0f);
+    oc.mixEnd = safeClampf(o.mix_end, -2.0f, 2.0f, 0.0f);
+    oc.freqStart = safeClampf(o.freq_start_hz, 10.0f, 18000.0f, 440.0f);
+    oc.freqEnd = safeClampf(o.freq_end_hz, 10.0f, 18000.0f, oc.freqStart);
+    oc.slideStart = safeClampf(o.slide_hz_per_s, -12000.0f, 12000.0f, 0.0f);
+    oc.dSlide = safeClampf(o.dslide_hz_per_s2, -18000.0f, 18000.0f, 0.0f);
+    oc.dutyStart = safeClampf(o.duty_start, 0.05f, 0.95f, 0.5f);
+    oc.dutyEnd = safeClampf(o.duty_end, 0.05f, 0.95f, 0.5f);
+    const float hpHz = safeClampf(o.noise_hp_hz, 0.0f, 12000.0f, 0.0f);
+    const float lpHz = safeClampf(o.noise_lp_hz, 0.0f, 20000.0f, 0.0f);
+    oc.hasHp = hpHz > 0.0f;
+    oc.hasLp = lpHz > 0.0f;
+    oc.hpAlpha = oc.hasHp ? onePoleAlpha(hpHz) : 0.0f;
+    oc.lpAlpha = oc.hasLp ? onePoleAlpha(lpHz) : 0.0f;
+  }
+}
+
+static inline void updateRepeatDerivedCache() {
+  g_synth.c.repeatGain = powf(g_synth.c.repeatDecay, (float)g_synth.repeatIndex);
+  g_synth.c.repeatSemi = g_synth.c.repeatSemiStep * (float)g_synth.repeatIndex;
+}
+
+static void resetBurstRuntime(bool resetPhaser, bool resetArp) {
+  const SynthRuntimeCache& c = g_synth.c;
+  g_synth.retriggerSamples = c.retriggerSamples;
   g_synth.retriggerCounter = 0;
   if (resetArp) {
     g_synth.arpApplied = false;
@@ -193,13 +366,9 @@ static void resetBurstRuntime(const SoundPreset& p, bool resetPhaser, bool reset
     g_synth.o[i].reset();
     g_synth.noiseHpLpState[i] = 0.0f;
     g_synth.noiseLpState[i] = 0.0f;
-    const OscPreset& osc = p.osc[i];
-    g_synth.curFreqHz[i] =
-        safeClampf(osc.freq_start_hz, 10.0f, 18000.0f, 440.0f);
-    g_synth.curSlideHzPerS[i] =
-        safeClampf(osc.slide_hz_per_s, -12000.0f, 12000.0f, 0.0f);
-    g_synth.curDuty[i] =
-        safeClampf(osc.duty_start, 0.05f, 0.95f, 0.5f);
+    g_synth.curFreqHz[i] = c.osc[i].freqStart;
+    g_synth.curSlideHzPerS[i] = c.osc[i].slideStart;
+    g_synth.curDuty[i] = c.osc[i].dutyStart;
   }
 
   if (resetPhaser) {
@@ -210,15 +379,10 @@ static void resetBurstRuntime(const SoundPreset& p, bool resetPhaser, bool reset
   }
 }
 
-static inline float applyPhaser(float dry, float u, const PhaserPreset& p) {
-  const float mix = safeClampf(p.mix, 0.0f, 1.0f, 0.0f);
-  if (mix <= 0.0f) return dry;
+static inline float applyPhaser(float dry, float u, const SynthRuntimeCache& c) {
+  if (c.phaserMix <= 0.0f) return dry;
 
-  const float maxDelayMs =
-      ((float)(PHASER_BUF_SIZE - 2) * 1000.0f) / (float)SR;
-  const float dStart = safeClampf(p.delay_start_ms, 0.0f, maxDelayMs, 0.0f);
-  const float dEnd = safeClampf(p.delay_end_ms, 0.0f, maxDelayMs, dStart);
-  const float dMs = lerp(dStart, dEnd, clampf(u, 0.0f, 1.0f));
+  const float dMs = lerp(c.phaserDelayStartMs, c.phaserDelayEndMs, clampf(u, 0.0f, 1.0f));
   const float dSamplesF = dMs * (float)SR * 0.001f;
   const uint16_t delaySamples =
       (uint16_t)clampf(dSamplesF, 0.0f, (float)(PHASER_BUF_SIZE - 2));
@@ -230,20 +394,22 @@ static inline float applyPhaser(float dry, float u, const PhaserPreset& p) {
   g_synth.phaserWrite =
       (uint16_t)((g_synth.phaserWrite + 1u) & (PHASER_BUF_SIZE - 1u));
 
-  return lerp(dry, wet, mix);
+  return lerp(dry, wet, c.phaserMix);
 }
 
 static void triggerSound(uint8_t id) {
   if (id >= PRESET_COUNT) return;
   const SoundPreset& p = kSoundPresets[id];
-  g_synth.soundId   = id;
-  g_synth.playing   = true;
+  buildRuntimeCache(p);
+  g_synth.soundId = id;
+  g_synth.playing = true;
   g_synth.repeatIndex = 0;
   g_synth.burstSamplePos = 0;
   g_synth.gapSamplesRemaining = 0;
   g_synth.lfoPhase = 0;
   g_synth.rng = 0xA5A5A5A5u ^ ((uint32_t)id * 0x9E3779B9u);
-  resetBurstRuntime(p, true, true);
+  updateRepeatDerivedCache();
+  resetBurstRuntime(true, true);
 }
 
 static float synthSample() {
@@ -254,44 +420,31 @@ static float synthSample() {
     return 0.0f;
   }
 
-  const SoundPreset& p = kSoundPresets[g_synth.soundId];
-  const float dur = safeClampf(p.duration_s, 0.005f, 8.0f, 0.2f);
-  if (dur <= 0.0f) {
+  const SynthRuntimeCache& c = g_synth.c;
+  if (c.dur <= 0.0f) {
     g_synth.playing = false;
     return 0.0f;
   }
 
-  const uint8_t repeatCount =
-      (uint8_t)safeClampf((float)p.repeat.count, 1.0f, 8.0f, 1.0f);
-  const float gap_s = safeClampf(p.repeat.gap_s, 0.0f, 1.0f, 0.0f);
-  const float repeatDecay =
-      safeClampf(p.repeat.gain_decay_per_repeat, 0.0f, 1.0f, 1.0f);
-  const float repeatSemiStep =
-      safeClampf(p.repeat.pitch_semitone_step, -24.0f, 24.0f, 0.0f);
-
-  const float lfoRateHz = safeClampf(p.lfo.rate_hz, 0.0f, 30.0f, 0.0f);
-  const float lfoPitchCentsDepth =
-      safeClampf(p.lfo.pitch_cents_depth, 0.0f, 400.0f, 0.0f);
-  const float lfoAmpDepth = safeClampf(p.lfo.amp_depth, 0.0f, 1.0f, 0.0f);
-
   float lfo = 0.0f;
-  if (lfoRateHz > 0.0f && (lfoPitchCentsDepth > 0.0f || lfoAmpDepth > 0.0f)) {
-    g_synth.lfoPhase += phaseIncFromHz(lfoRateHz);
+  if (c.lfoEnabled) {
+    g_synth.lfoPhase += c.lfoPhaseInc;
     lfo = (float)lutSineLerp(g_synth.lfoPhase) / 32767.0f;
   }
 
-  if (g_synth.gapSamplesRemaining > 0) {
+  if (g_synth.gapSamplesRemaining > 0u) {
     g_synth.gapSamplesRemaining--;
     return 0.0f;
   }
 
   const float t = (float)g_synth.burstSamplePos / (float)SR;
-  if (t >= dur) {
-    if ((g_synth.repeatIndex + 1u) < repeatCount) {
+  if (t >= c.dur) {
+    if ((g_synth.repeatIndex + 1u) < c.repeatCount) {
       g_synth.repeatIndex++;
       g_synth.burstSamplePos = 0;
-      g_synth.gapSamplesRemaining = (uint32_t)lrintf(gap_s * (float)SR);
-      resetBurstRuntime(p, true, true);
+      g_synth.gapSamplesRemaining = c.gapSamples;
+      updateRepeatDerivedCache();
+      resetBurstRuntime(true, true);
       return 0.0f;
     }
     g_synth.playing = false;
@@ -300,76 +453,57 @@ static float synthSample() {
 
   if (g_synth.retriggerSamples > 0u) {
     if (g_synth.retriggerCounter >= g_synth.retriggerSamples) {
-      resetBurstRuntime(p, false, false);
+      resetBurstRuntime(false, false);
       g_synth.retriggerCounter = 0u;
     }
     g_synth.retriggerCounter++;
   }
 
-  const float u = clampf(t / dur, 0.0f, 1.0f);
-  const float attack = safeClampf(p.attack_s, 0.0f, dur, 0.0f);
-  const float release = safeClampf(p.release_s, 0.0f, dur, 0.0f);
-  const float loudStart = safeClampf(p.loudness_start, 0.0f, 1.2f, 1.0f);
-  const float loudEnd = safeClampf(p.loudness_end, 0.0f, 1.2f, loudStart);
-
-  const float arpJumpTime = safeClampf(p.arp.jump_time_s, 0.0f, dur, 0.0f);
-  const float arpJumpSemi = safeClampf(p.arp.jump_semitones, -24.0f, 24.0f, 0.0f);
-  if (!g_synth.arpApplied && arpJumpTime > 0.0f && t >= arpJumpTime) {
+  const float u = clampf(t / c.dur, 0.0f, 1.0f);
+  if (!g_synth.arpApplied && c.arpJumpTime > 0.0f && t >= c.arpJumpTime) {
     g_synth.arpApplied = true;
   }
 
-  const float ampShape = twoStageShape(u, p.shape.mid_u, p.shape.mid_gain);
-  const float ampBase = envAR(t, dur, attack, release) *
-                        lerp(loudStart, loudEnd, u) * ampShape;
-  const float ampLfo = 1.0f - lfoAmpDepth + lfoAmpDepth * ((lfo + 1.0f) * 0.5f);
-  const float repeatGain = powf(repeatDecay, (float)g_synth.repeatIndex);
-  const float repeatSemi = repeatSemiStep * (float)g_synth.repeatIndex;
+  const float ampShape = twoStageShapeClamped(u, c.shapeMidU, c.shapeMidGain);
+  const float ampBase = envAR(t, c.dur, c.attack, c.release) *
+                        lerp(c.loudStart, c.loudEnd, u) * ampShape;
+  const float ampLfo = 1.0f - c.lfoAmpDepth + c.lfoAmpDepth * ((lfo + 1.0f) * 0.5f);
   const float pitchSemi =
-      repeatSemi + (lfo * lfoPitchCentsDepth * 0.01f) + (g_synth.arpApplied ? arpJumpSemi : 0.0f);
+      c.repeatSemi + (lfo * c.lfoPitchCentsDepth * 0.01f) + (g_synth.arpApplied ? c.arpJumpSemi : 0.0f);
   const float pitchRatio = semitoneRatio(pitchSemi);
   float mix = 0.0f;
-  const float dt = 1.0f / (float)SR;
+  constexpr float dt = 1.0f / (float)SR;
 
   for (uint8_t i = 0; i < PRESET_OSC_COUNT; ++i) {
-    const OscPreset& o = p.osc[i];
-    const float m =
-        safeClampf(lerp(o.mix_start, o.mix_end, u), -2.0f, 2.0f, 0.0f);
+    const OscRuntimeCache& o = c.osc[i];
+    const float m = lerp(o.mixStart, o.mixEnd, u);
     float s = 0.0f;
 
     if (o.source == SRC_NOISE) {
-      const float hpHz = safeClampf(o.noise_hp_hz, 0.0f, 12000.0f, 0.0f);
-      const float lpHz = safeClampf(o.noise_lp_hz, 0.0f, 20000.0f, 0.0f);
-      float n = whiteNoise();
-
+      const float n = whiteNoise();
       float hpOut = n;
-      if (hpHz > 0.0f) {
-        const float aHp = onePoleAlpha(hpHz);
-        g_synth.noiseHpLpState[i] += aHp * (n - g_synth.noiseHpLpState[i]);
+      if (o.hasHp) {
+        g_synth.noiseHpLpState[i] += o.hpAlpha * (n - g_synth.noiseHpLpState[i]);
         hpOut = n - g_synth.noiseHpLpState[i];
       }
 
-      if (lpHz > 0.0f) {
-        const float aLp = onePoleAlpha(lpHz);
-        g_synth.noiseLpState[i] += aLp * (hpOut - g_synth.noiseLpState[i]);
+      if (o.hasLp) {
+        g_synth.noiseLpState[i] += o.lpAlpha * (hpOut - g_synth.noiseLpState[i]);
         s = g_synth.noiseLpState[i];
       } else {
         s = hpOut;
       }
     } else {
-      const float fStart = safeClampf(o.freq_start_hz, 10.0f, 18000.0f, 440.0f);
-      const float fEnd = safeClampf(o.freq_end_hz, 10.0f, 18000.0f, fStart);
-      const float dSlide = safeClampf(o.dslide_hz_per_s2, -18000.0f, 18000.0f, 0.0f);
-      g_synth.curSlideHzPerS[i] += dSlide * dt;
+      g_synth.curSlideHzPerS[i] += o.dSlide * dt;
       g_synth.curSlideHzPerS[i] =
           safeClampf(g_synth.curSlideHzPerS[i], -18000.0f, 18000.0f, 0.0f);
       g_synth.curFreqHz[i] += g_synth.curSlideHzPerS[i] * dt;
-      g_synth.curDuty[i] =
-          safeClampf(lerp(o.duty_start, o.duty_end, u), 0.05f, 0.95f, 0.5f);
+      g_synth.curDuty[i] = lerp(o.dutyStart, o.dutyEnd, u);
 
-      const float baseFreq = lerp(fStart, fEnd, u);
-      const float slideOffset = g_synth.curFreqHz[i] - fStart;
+      const float baseFreq = lerp(o.freqStart, o.freqEnd, u);
+      const float slideOffset = g_synth.curFreqHz[i] - o.freqStart;
       float f = (baseFreq + slideOffset) * pitchRatio;
-      f = safeClampf(f, 10.0f, 18000.0f, fStart);
+      f = clampf(f, 10.0f, 18000.0f);
       const uint32_t inc = phaseIncFromHz(f);
       s = oscWaveSample(g_synth.o[i], inc, o.source, g_synth.curDuty[i]);
     }
@@ -378,8 +512,8 @@ static float synthSample() {
   }
 
   g_synth.burstSamplePos++;
-  const float dry = ampBase * ampLfo * repeatGain * mix;
-  return applyPhaser(dry, u, p.phaser);
+  const float dry = ampBase * ampLfo * c.repeatGain * mix;
+  return applyPhaser(dry, u, c);
 }
 
 // ---------------- Audio command channel (core0 -> core1) ----------------
@@ -446,16 +580,22 @@ static void handleAudioCmd(uint32_t raw) {
   switch (cmd) {
     case CMD_TRIGGER_SOUND:
       triggerSound(arg);
+      ringClear();
+      g_ringStartPrimeActive = true;
       publishAudioUiState(true, g_synth.soundId);
       break;
     case CMD_STOP_SOUND:
       g_synth.playing = false;
+      ringClear();
+      g_ringStartPrimeActive = false;
       publishAudioUiState(false, g_synth.soundId);
       break;
     case CMD_STREAM_ENABLE:
       g_streamEnabled = (arg != 0);
       if (!g_streamEnabled) {
         g_synth.playing = false;
+        ringClear();
+        g_ringStartPrimeActive = false;
         publishAudioUiState(false, g_synth.soundId);
       }
       break;
@@ -680,6 +820,54 @@ void setup1() {
   // Audio worker core; initialization is handled in setup().
 }
 
+static inline int16_t synthToPcm16(float y) {
+  // Keep output scaling identical to prior firmware behavior.
+  constexpr float MASTER_GAIN = 0.80f;
+  y *= MASTER_GAIN;
+  if (y > 0.999f) y = 0.999f;
+  if (y < -0.999f) y = -0.999f;
+  return (int16_t)lrintf(y * 32767.0f);
+}
+
+static void produceAudioBatch(uint32_t maxFrames) {
+  uint32_t frameCount = maxFrames;
+  if (frameCount > AUDIO_SYNTH_BATCH_FRAMES) frameCount = AUDIO_SYNTH_BATCH_FRAMES;
+  const uint32_t freeFrames = ringFramesFree();
+  if (frameCount > freeFrames) frameCount = freeFrames;
+  for (uint32_t i = 0; i < frameCount; ++i) {
+    if (ringFramesFree() == 0u) break;
+    const int16_t s = synthToPcm16(synthSample());
+    if (!ringPushStereoFrame(s, s)) break;
+  }
+}
+
+static void writeRingChunkToBt() {
+  static int16_t txChunk[AUDIO_TX_CHUNK_SAMPLES];
+  size_t availableSamples = g_ringCount;
+  if (availableSamples < CHANNELS) return;
+
+  size_t chunkSamples = availableSamples;
+  if (chunkSamples > AUDIO_TX_CHUNK_SAMPLES) chunkSamples = AUDIO_TX_CHUNK_SAMPLES;
+  chunkSamples -= (chunkSamples % CHANNELS);
+  if (chunkSamples == 0) return;
+
+  const size_t gotSamples = ringPopSamples(txChunk, chunkSamples);
+  if (gotSamples == 0) return;
+
+  size_t nbytes = gotSamples * sizeof(int16_t);
+  const uint8_t* p = reinterpret_cast<const uint8_t*>(txChunk);
+  while (nbytes > 0 && g_streamEnabled && g_btConnected) {
+    const int written = bt.write(p, nbytes);
+    if (written > 0) {
+      p += (size_t)written;
+      nbytes -= (size_t)written;
+    } else {
+      processAudioCmdQueue();
+      delay(1);
+    }
+  }
+}
+
 void loop1() {
   processAudioCmdQueue();
 
@@ -692,38 +880,27 @@ void loop1() {
     if (!g_btConnected) {
       g_synth.playing = false;
     }
+    ringClear();
+    g_ringStartPrimeActive = false;
     publishAudioUiState(false, g_synth.soundId);
     delay(1);
     return;
   }
 
-  static int16_t buf[FRAMES * CHANNELS];
+  writeRingChunkToBt();
+  processAudioCmdQueue();
 
-  for (size_t i = 0; i < FRAMES; ++i) {
-    float y = synthSample();
-
-    // master gain + soft clip guard
-    const float MASTER_GAIN = 0.80f;
-    y *= MASTER_GAIN;
-    if (y > 0.999f) y = 0.999f;
-    if (y < -0.999f) y = -0.999f;
-
-    int16_t s = (int16_t)lrintf(y * 32767.0f);
-    buf[2 * i + 0] = s;
-    buf[2 * i + 1] = s;
-  }
-
-  size_t nbytes = sizeof(buf);
-  const uint8_t* p = reinterpret_cast<const uint8_t*>(buf);
-  while (nbytes && g_streamEnabled && g_btConnected) {
-    int w = bt.write(p, nbytes);
-    if (w > 0) {
-      p += w;
-      nbytes -= (size_t)w;
+  const uint32_t framesAvail = ringFramesAvailable();
+  if (g_ringStartPrimeActive) {
+    if (framesAvail < AUDIO_RING_START_FRAMES) {
+      produceAudioBatch(AUDIO_RING_START_FRAMES - framesAvail);
     } else {
-      processAudioCmdQueue();
-      delay(1);
+      g_ringStartPrimeActive = false;
     }
+  } else if (framesAvail < AUDIO_RING_LOW_FRAMES) {
+    produceAudioBatch(AUDIO_RING_LOW_FRAMES - framesAvail);
+  } else if (framesAvail < AUDIO_RING_HIGH_FRAMES) {
+    produceAudioBatch(AUDIO_RING_HIGH_FRAMES - framesAvail);
   }
 
   publishAudioUiState(g_synth.playing, g_synth.soundId);
