@@ -155,6 +155,13 @@
       transform: translateY(0);
     }
 
+    button:disabled {
+      opacity: 0.45;
+      cursor: not-allowed;
+      transform: none;
+      border-color: #2b3f57;
+    }
+
     .status {
       border-radius: 8px;
       border: 1px solid var(--line);
@@ -196,6 +203,11 @@
       border-color: var(--accent);
       background: linear-gradient(180deg, #173149, #12263a);
       color: #d8f7ff;
+    }
+
+    .preset-list button.dirty {
+      border-color: #b58d47;
+      box-shadow: inset 0 0 0 1px rgba(255, 200, 110, 0.28);
     }
 
     .section {
@@ -255,6 +267,64 @@
       background: #7ee0ff;
       cursor: help;
       user-select: none;
+    }
+
+    [data-help] {
+      cursor: help;
+    }
+
+    #inspectorPanel {
+      max-height: calc(100vh - 38px);
+    }
+
+    #inspectorPanel .panel-body {
+      overflow: hidden;
+      gap: 8px;
+    }
+
+    .inspector-toolbar {
+      display: grid;
+      gap: 8px;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: rgba(7, 12, 18, 0.66);
+      padding: 8px;
+    }
+
+    .inspector-scroll {
+      min-height: 0;
+      overflow: auto;
+      padding-right: 4px;
+    }
+
+    #inspectorBody {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+
+    .hover-tip {
+      position: fixed;
+      z-index: 2500;
+      max-width: 340px;
+      border: 1px solid #3a5775;
+      border-radius: 9px;
+      padding: 7px 9px;
+      background: rgba(6, 12, 19, 0.95);
+      color: #dff2ff;
+      font-size: 0.72rem;
+      line-height: 1.35;
+      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.42);
+      pointer-events: none;
+      opacity: 0;
+      transform: translateY(2px);
+      transition: opacity 90ms ease-out, transform 90ms ease-out;
+      white-space: normal;
+    }
+
+    .hover-tip.show {
+      opacity: 1;
+      transform: translateY(0);
     }
 
     .control .left {
@@ -378,8 +448,19 @@
 
       <section class="panel" id="inspectorPanel">
         <h2>Parameter Inspector</h2>
-        <div class="panel-body" id="inspectorBody">
-          <div class="small">Parse presets to start editing.</div>
+        <div class="panel-body">
+          <div class="inspector-toolbar">
+            <div class="button-row">
+              <button id="applyPresetBtn">Apply Staged</button>
+              <button id="resetPresetBtn">Reset Staged</button>
+            </div>
+            <div class="small" id="stageStatus">No staged changes.</div>
+          </div>
+          <div class="inspector-scroll" id="inspectorScroll">
+            <div id="inspectorBody">
+              <div class="small">Parse presets to start editing.</div>
+            </div>
+          </div>
         </div>
       </section>
 
@@ -419,6 +500,7 @@
       </section>
     </main>
   </div>
+  <div class="hover-tip" id="hoverTip" aria-hidden="true"></div>
 
   <script>
     "use strict";
@@ -811,6 +893,10 @@
       presetList: document.getElementById("presetList"),
       presetCountText: document.getElementById("presetCountText"),
       inspectorBody: document.getElementById("inspectorBody"),
+      applyPresetBtn: document.getElementById("applyPresetBtn"),
+      resetPresetBtn: document.getElementById("resetPresetBtn"),
+      stageStatus: document.getElementById("stageStatus"),
+      hoverTip: document.getElementById("hoverTip"),
       playBtn: document.getElementById("playBtn"),
       stopBtn: document.getElementById("stopBtn"),
       renderBtn: document.getElementById("renderBtn"),
@@ -825,11 +911,13 @@
     };
 
     const app = {
-      presets: [],
+      committedPresets: [],
+      stagedPresets: [],
       selectedIndex: 0,
       currentPCM: null,
       audioCtx: null,
       currentSource: null,
+      activeHelpEl: null,
     };
 
     function clampf(x, a, b) {
@@ -1697,21 +1785,70 @@
     }
 
     function getSelectedPreset() {
-      if (app.selectedIndex < 0 || app.selectedIndex >= app.presets.length) return null;
-      return app.presets[app.selectedIndex];
+      if (app.selectedIndex < 0 || app.selectedIndex >= app.stagedPresets.length) return null;
+      return app.stagedPresets[app.selectedIndex];
+    }
+
+    function getSelectedCommittedPreset() {
+      if (app.selectedIndex < 0 || app.selectedIndex >= app.committedPresets.length) return null;
+      return app.committedPresets[app.selectedIndex];
+    }
+
+    function presetsEqual(a, b) {
+      return JSON.stringify(a) === JSON.stringify(b);
+    }
+
+    function isPresetDirty(index) {
+      if (index < 0 || index >= app.committedPresets.length || index >= app.stagedPresets.length) return false;
+      return !presetsEqual(app.committedPresets[index], app.stagedPresets[index]);
+    }
+
+    function dirtyCount() {
+      let count = 0;
+      for (let i = 0; i < app.committedPresets.length; i++) {
+        if (isPresetDirty(i)) count += 1;
+      }
+      return count;
+    }
+
+    function renderStageStatus() {
+      const totalDirty = dirtyCount();
+      const selectedDirty = isPresetDirty(app.selectedIndex);
+      if (!app.committedPresets.length) {
+        els.stageStatus.textContent = "No staged changes.";
+        els.applyPresetBtn.disabled = true;
+        els.resetPresetBtn.disabled = true;
+        return;
+      }
+
+      els.applyPresetBtn.disabled = !selectedDirty;
+      els.resetPresetBtn.disabled = !selectedDirty;
+
+      if (selectedDirty) {
+        els.stageStatus.textContent =
+          `Staged changes pending for selected preset. (${totalDirty} preset${totalDirty === 1 ? "" : "s"} dirty total)`;
+      } else if (totalDirty > 0) {
+        els.stageStatus.textContent =
+          `${totalDirty} other preset${totalDirty === 1 ? "" : "s"} have staged changes.`;
+      } else {
+        els.stageStatus.textContent = "No staged changes.";
+      }
     }
 
     function renderPresetList() {
       els.presetList.innerHTML = "";
-      app.presets.forEach((preset, idx) => {
+      app.committedPresets.forEach((preset, idx) => {
         const li = document.createElement("li");
         const btn = document.createElement("button");
         btn.type = "button";
-        btn.textContent = `${idx + 1}. ${preset.name}`;
+        const dirty = isPresetDirty(idx);
+        btn.textContent = `${idx + 1}. ${preset.name}${dirty ? " *" : ""}`;
         btn.classList.toggle("active", idx === app.selectedIndex);
+        btn.classList.toggle("dirty", dirty);
         btn.addEventListener("click", () => {
           app.selectedIndex = idx;
           renderPresetList();
+          renderStageStatus();
           renderInspector();
           renderSelectedPresetAudio(false);
         });
@@ -1719,8 +1856,8 @@
         els.presetList.appendChild(li);
       });
 
-      els.presetCountText.textContent = app.presets.length
-        ? `${app.presets.length} presets loaded.`
+      els.presetCountText.textContent = app.committedPresets.length
+        ? `${app.committedPresets.length} presets loaded.`
         : "No presets loaded.";
     }
 
@@ -1738,6 +1875,73 @@
       cur[path[path.length - 1]] = value;
     }
 
+    function attachHelp(el, helpText) {
+      if (!helpText) return;
+      el.dataset.help = helpText;
+    }
+
+    function positionHoverTip(clientX, clientY) {
+      const tip = els.hoverTip;
+      const pad = 14;
+      const w = tip.offsetWidth || 280;
+      const h = tip.offsetHeight || 60;
+      const maxX = window.innerWidth - w - 8;
+      const maxY = window.innerHeight - h - 8;
+      const x = clampf(clientX + pad, 8, Math.max(8, maxX));
+      const y = clampf(clientY + pad, 8, Math.max(8, maxY));
+      tip.style.left = `${x}px`;
+      tip.style.top = `${y}px`;
+    }
+
+    function showHoverTip(helpText, clientX, clientY) {
+      if (!helpText) return;
+      els.hoverTip.textContent = helpText;
+      els.hoverTip.classList.add("show");
+      els.hoverTip.setAttribute("aria-hidden", "false");
+      positionHoverTip(clientX, clientY);
+    }
+
+    function hideHoverTip() {
+      els.hoverTip.classList.remove("show");
+      els.hoverTip.setAttribute("aria-hidden", "true");
+      app.activeHelpEl = null;
+    }
+
+    function wireHoverHelp() {
+      document.addEventListener("pointerover", (ev) => {
+        const target = ev.target instanceof Element ? ev.target.closest("[data-help]") : null;
+        if (!target) return;
+        app.activeHelpEl = target;
+        showHoverTip(target.dataset.help || "", ev.clientX, ev.clientY);
+      });
+
+      document.addEventListener("pointermove", (ev) => {
+        if (!app.activeHelpEl) return;
+        positionHoverTip(ev.clientX, ev.clientY);
+      });
+
+      document.addEventListener("pointerout", (ev) => {
+        if (!app.activeHelpEl) return;
+        const from = ev.target instanceof Element ? ev.target.closest("[data-help]") : null;
+        if (from !== app.activeHelpEl) return;
+        const to = ev.relatedTarget instanceof Element ? ev.relatedTarget.closest("[data-help]") : null;
+        if (to) {
+          app.activeHelpEl = to;
+          showHoverTip(to.dataset.help || "", ev.clientX, ev.clientY);
+          return;
+        }
+        hideHoverTip();
+      });
+
+      document.addEventListener("scroll", () => {
+        if (app.activeHelpEl) hideHoverTip();
+      }, true);
+
+      document.addEventListener("pointerdown", () => {
+        if (app.activeHelpEl) hideHoverTip();
+      });
+    }
+
     function createLabelWithTooltip(labelText, tooltipText) {
       const label = document.createElement("label");
       const row = document.createElement("span");
@@ -1745,11 +1949,10 @@
       row.textContent = labelText;
 
       if (tooltipText) {
-        label.title = tooltipText;
         const tip = document.createElement("span");
         tip.className = "tip-badge";
         tip.textContent = "?";
-        tip.title = tooltipText;
+        attachHelp(tip, tooltipText);
         row.appendChild(tip);
       }
 
@@ -1758,8 +1961,8 @@
     }
 
     function updateEditorFromState() {
-      if (!app.presets.length) return;
-      els.editor.value = formatPresetBlock(app.presets);
+      if (!app.committedPresets.length) return;
+      els.editor.value = formatPresetBlock(app.committedPresets);
     }
 
     const queuePreview = debounce(() => {
@@ -1768,7 +1971,7 @@
 
     function onPresetMutated() {
       renderPresetList();
-      updateEditorFromState();
+      renderStageStatus();
       queuePreview();
     }
 
@@ -1791,7 +1994,6 @@
       let cur = Number(getByPath(preset, path));
       if (!Number.isFinite(cur)) cur = cfg.min;
       range.value = String(cur);
-      if (tooltip) range.title = tooltip;
 
       const num = document.createElement("input");
       num.type = "number";
@@ -1799,7 +2001,6 @@
       num.max = String(cfg.max);
       num.step = String(cfg.step);
       num.value = String(cur);
-      if (tooltip) num.title = tooltip;
 
       const applyValue = (raw) => {
         let next = Number(raw);
@@ -1818,7 +2019,6 @@
       left.appendChild(range);
       row.appendChild(left);
       row.appendChild(num);
-      if (tooltip) row.title = tooltip;
       sectionBody.appendChild(row);
     }
 
@@ -1836,7 +2036,6 @@
       textInput.type = "text";
       textInput.maxLength = maxLen;
       textInput.value = String(getByPath(preset, path) || "");
-      if (tooltip) textInput.title = tooltip;
       textInput.addEventListener("input", () => {
         setByPath(preset, path, textInput.value);
         onPresetMutated();
@@ -1845,7 +2044,6 @@
       left.appendChild(textInput);
       row.appendChild(left);
       row.appendChild(document.createElement("div"));
-      if (tooltip) row.title = tooltip;
       sectionBody.appendChild(row);
     }
 
@@ -1867,7 +2065,6 @@
         select.appendChild(opt);
       }
       select.value = preset.osc[oscIndex].source;
-      if (tooltip) select.title = tooltip;
       select.addEventListener("change", () => {
         preset.osc[oscIndex].source = select.value;
         onPresetMutated();
@@ -1876,7 +2073,6 @@
       left.appendChild(select);
       row.appendChild(left);
       row.appendChild(document.createElement("div"));
-      if (tooltip) row.title = tooltip;
       sectionBody.appendChild(row);
     }
 
@@ -2019,13 +2215,46 @@
         return false;
       }
 
-      app.presets = deepClone(parsed.presets);
-      app.selectedIndex = clampf(app.selectedIndex, 0, Math.max(0, app.presets.length - 1));
-      setStatus(`Parsed ${app.presets.length} presets successfully.`);
+      app.committedPresets = deepClone(parsed.presets);
+      app.stagedPresets = deepClone(parsed.presets);
+      app.selectedIndex = clampf(app.selectedIndex, 0, Math.max(0, app.committedPresets.length - 1));
+      setStatus(`Parsed ${app.committedPresets.length} presets successfully.`);
       renderPresetList();
+      renderStageStatus();
       renderInspector();
       renderSelectedPresetAudio(false);
       return true;
+    }
+
+    function applySelectedStagedPreset() {
+      const staged = getSelectedPreset();
+      if (!staged) return;
+      if (!isPresetDirty(app.selectedIndex)) {
+        setStatus("Selected preset has no staged changes.");
+        return;
+      }
+
+      app.committedPresets[app.selectedIndex] = deepClone(staged);
+      updateEditorFromState();
+      renderPresetList();
+      renderStageStatus();
+      setStatus(`Applied staged changes for preset ${app.selectedIndex + 1}.`);
+    }
+
+    function resetSelectedStagedPreset() {
+      const committed = getSelectedCommittedPreset();
+      if (!committed) return;
+      if (!isPresetDirty(app.selectedIndex)) {
+        setStatus("Selected preset already matches committed values.");
+        return;
+      }
+
+      app.stagedPresets[app.selectedIndex] = deepClone(committed);
+      renderPresetList();
+      renderStageStatus();
+      renderInspector();
+      renderSelectedPresetAudio(false);
+      setStatus(`Reset staged changes for preset ${app.selectedIndex + 1}.`);
     }
 
     async function runSelfTests() {
@@ -2122,23 +2351,31 @@
       });
 
       els.formatBtn.addEventListener("click", () => {
-        if (!app.presets.length) {
+        if (!app.committedPresets.length) {
           setStatus("Nothing to format. Parse valid presets first.", true);
           return;
         }
-        els.editor.value = formatPresetBlock(app.presets);
+        els.editor.value = formatPresetBlock(app.committedPresets);
         setStatus("Formatted preset block.");
       });
 
       els.copyBtn.addEventListener("click", async () => {
-        if (!app.presets.length) {
+        if (!app.committedPresets.length) {
           setStatus("Nothing to copy. Parse valid presets first.", true);
           return;
         }
-        const block = formatPresetBlock(app.presets);
+        const block = formatPresetBlock(app.committedPresets);
         const ok = await copyToClipboard(block);
         if (ok) setStatus("Copied canonical preset block to clipboard.");
         else setStatus("Clipboard not available. Copy manually from editor.", true);
+      });
+
+      els.applyPresetBtn.addEventListener("click", () => {
+        applySelectedStagedPreset();
+      });
+
+      els.resetPresetBtn.addEventListener("click", () => {
+        resetSelectedStagedPreset();
       });
 
       els.loadDemoBtn.addEventListener("click", () => {
@@ -2188,8 +2425,10 @@
 
     function init() {
       els.editor.value = DEMO_BLOCK;
+      wireHoverHelp();
       wireEvents();
       parseEditorContent();
+      renderStageStatus();
       setTestStatus("Self tests not run yet.");
     }
 
