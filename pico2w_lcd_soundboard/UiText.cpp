@@ -8,6 +8,7 @@ namespace {
 
 struct Glyph5x7 {
   char c;
+  // Each row uses lower 5 bits (MSB-left in drawChar()).
   uint8_t rows[7];
 };
 
@@ -58,11 +59,13 @@ static const Glyph5x7 kGlyphs[] = {
   {'Z', {0x1F, 0x01, 0x02, 0x04, 0x08, 0x10, 0x1F}},
 };
 
+// Framebuffer pointer comes from LCD driver and uses RGB565 words.
 static uint16_t* sFb = nullptr;
 static int sWidth = 0;
 static int sHeight = 0;
 
 static inline uint16_t lcdColor(uint16_t color) {
+  // Waveshare ST7789 path expects byte-swapped 16-bit RGB565 in memory.
   return (uint16_t)(((color << 8) & 0xFF00u) | ((color >> 8) & 0x00FFu));
 }
 
@@ -76,6 +79,7 @@ static inline void putPixel(int x, int y, uint16_t color) {
 }
 
 static const uint8_t* glyphExact(char ch) {
+  // Font is uppercase-only, so normalize once here.
   const char c = (char)toupper((unsigned char)ch);
   for (size_t i = 0; i < sizeof(kGlyphs) / sizeof(kGlyphs[0]); ++i) {
     if (kGlyphs[i].c == c) {
@@ -89,6 +93,7 @@ static const uint8_t* glyphFor(char ch) {
   const uint8_t* exact = glyphExact(ch);
   if (exact) return exact;
 
+  // Unknown characters render as '?' rather than disappearing.
   for (size_t i = 0; i < sizeof(kGlyphs) / sizeof(kGlyphs[0]); ++i) {
     if (kGlyphs[i].c == '?') {
       return kGlyphs[i].rows;
@@ -103,6 +108,7 @@ static void drawChar(int x, int y, char ch, uint16_t fg, uint16_t bg) {
 
   for (int ry = 0; ry < 8; ++ry) {
     for (int rx = 0; rx < 6; ++rx) {
+      // Draw in a 6x8 cell so text has built-in inter-character spacing.
       bool on = false;
       if (ry < 7 && rx < 5) {
         on = (g[ry] & (1u << (4 - rx))) != 0;
@@ -133,6 +139,7 @@ void UiFillRect(int x, int y, int w, int h, uint16_t color) {
   if (x1 <= x0 || y1 <= y0) return;
 
   const uint16_t c = lcdColor(color);
+  // Fill by rows to keep writes linear and cache-friendly.
   for (int yy = y0; yy < y1; ++yy) {
     uint16_t* row = sFb + (size_t)yy * (size_t)sWidth;
     for (int xx = x0; xx < x1; ++xx) {
@@ -156,6 +163,7 @@ void UiDrawText(int x, int y, const char* s, uint16_t fg, uint16_t bg) {
   int cx = x;
   for (size_t i = 0; s[i] != '\0'; ++i) {
     drawChar(cx, y, s[i], f, b);
+    // Fixed advance that matches drawChar() cell width.
     cx += 6;
   }
 }
@@ -172,6 +180,7 @@ void UiDrawTextClipped(int x, int y, int maxChars, const char* s, uint16_t fg, u
   if (maxChars >= (int)sizeof(tmp)) maxChars = (int)sizeof(tmp) - 1;
 
   if (maxChars <= 3) {
+    // Very tight label areas still get an obvious truncation marker.
     for (int i = 0; i < maxChars; ++i) tmp[i] = '.';
     tmp[maxChars] = '\0';
   } else {

@@ -7,6 +7,9 @@
  */
 
 #include <Arduino.h>
+// BluetoothAudio keeps AVRCP connection internals private. We need read-only
+// access to avrcp_cid so LEFT/RIGHT keys can control the *speaker's* volume
+// over AVRCP absolute-volume, not local PCM scaling.
 #define private public
 #include <BluetoothAudio.h>
 #undef private
@@ -28,6 +31,8 @@ struct SynthRuntimeCache;
 
 // ---------------- Bluetooth A2DP Source ----------------
 A2DPSource bt;
+// Preferred target speaker; reconnect logic tries this MAC first, then falls
+// back to "first discovered speaker" if needed.
 static const uint8_t SPEAKER_ADDR[6] = {0xE8, 0xD0, 0x3C, 0x9B, 0x38, 0x39};
 
 // ---------------- Audio format & block sizing ----------------
@@ -36,6 +41,7 @@ constexpr uint8_t  CHANNELS = 2;       // interleaved stereo (mono duplicated)
 constexpr uint8_t  SOUND_VIEW_SLOTS = 4;
 constexpr uint32_t BT_RECONNECT_MS = 3000;
 constexpr uint32_t BT_CONNECT_TIMEOUT_MS = 2500;
+// User-facing speaker volume policy (AVRCP absolute volume in 0..100%).
 constexpr uint8_t  SPEAKER_VOL_DEFAULT_PCT = 100;
 constexpr uint8_t  SPEAKER_VOL_STEP_PCT = 5;
 constexpr uint32_t SPEAKER_VOL_RETRY_MS = 250;
@@ -65,11 +71,15 @@ static_assert(AUDIO_TX_CHUNK_SAMPLES % CHANNELS == 0, "Tx chunk must align to st
 static uint8_t  g_presetWindowStart = 0;
 static uint32_t g_lastReconnectAttemptMs = 0;
 
+// Shared UI/audio state written by core1 (audio) and read by core0 (UI).
+// These fields are small and intentionally lock-free.
 static volatile uint32_t g_audioUiState = 0;
 static volatile bool g_streamEnabled = true;
 static volatile bool g_btConnected = false;
 static volatile bool g_btReady = false;
 static volatile bool g_btStateChanged = false;
+// Speaker-reported/target volume state. Pending means we still need to send
+// (or confirm) AVRCP absolute volume to the currently connected sink.
 static volatile uint8_t g_speakerVolPct = SPEAKER_VOL_DEFAULT_PCT;
 static volatile bool g_speakerVolPending = true;
 static volatile bool g_speakerVolChanged = true;
@@ -85,7 +95,9 @@ static uint8_t g_lastUiVolPending = 0xFF;
 
 enum BtConnectStage : uint8_t {
   BT_STAGE_IDLE = 0,
+  // Waiting for connect callback after explicit default-MAC connect attempt.
   BT_STAGE_WAIT_DEFAULT,
+  // Waiting for connect callback after fallback scan->connect attempt.
   BT_STAGE_WAIT_FALLBACK,
 };
 
@@ -93,6 +105,8 @@ static BtConnectStage g_btConnectStage = BT_STAGE_IDLE;
 static uint32_t g_btStageStartMs = 0;
 
 // ---------------- Core1 audio ring buffer ----------------
+// Large stereo ring buffer decouples synthesis cadence from Bluetooth write
+// stalls to reduce audible underruns/crackles.
 static int16_t g_audioRing[AUDIO_RING_SAMPLES];
 static uint32_t g_ringRead = 0;  // sample index
 static uint32_t g_ringWrite = 0; // sample index
@@ -105,6 +119,7 @@ constexpr uint32_t LUT_LEN  = (1u << LUT_BITS);
 static int16_t     SINE_LUT[LUT_LEN];
 
 static inline uint32_t phaseIncFromHz(float f) {
+  // 32-bit phase accumulator increment: f * 2^32 / sample_rate
   return (uint32_t)((double)f * (4294967296.0 / (double)SR));  // f * 2^32 / SR
 }
 
@@ -237,6 +252,8 @@ static inline uint8_t clampVolumePctInt(int v) {
 }
 
 static bool setSpeakerVolumePct(uint8_t pct) {
+  // True speaker volume path (AVRCP Absolute Volume). If AVRCP is not fully
+  // up yet, caller retries later via maybeApplySpeakerVolume().
   if (!g_btConnected) return false;
   const uint16_t avrcpCid = bt.media_tracker.avrcp_cid;
   if (avrcpCid == 0u) return false;
@@ -250,6 +267,8 @@ static void maybeApplySpeakerVolume(uint32_t nowMs) {
   if ((nowMs - g_lastSpeakerVolTryMs) < SPEAKER_VOL_RETRY_MS) return;
   g_lastSpeakerVolTryMs = nowMs;
   if (setSpeakerVolumePct(g_speakerVolPct)) {
+    // The speaker may still report back volume via onBtVolume(), but once this
+    // command is accepted we stop retrying to keep loop() lightweight.
     g_speakerVolPending = false;
     g_speakerVolChanged = true;
   }
@@ -280,6 +299,7 @@ static inline bool ringPushStereoFrame(int16_t left, int16_t right) {
 }
 
 static size_t ringPopSamples(int16_t* out, size_t maxSamples) {
+  // Reads from ring in up to 2 memcpy spans to handle wrap-around.
   if (maxSamples == 0 || g_ringCount == 0) return 0;
   size_t samples = maxSamples;
   if (samples > g_ringCount) samples = g_ringCount;
@@ -311,12 +331,14 @@ static inline float whiteNoise() {
 }
 
 static inline float twoStageShapeClamped(float u, float mid_u, float mid_gain) {
+  // Piecewise-linear shape: (0,1) -> (mid_u,mid_gain) -> (1,0).
   const float x = clampf(u, 0.0f, 1.0f);
   if (x < mid_u) return lerp(1.0f, mid_gain, x / mid_u);
   return lerp(mid_gain, 0.0f, (x - mid_u) / (1.0f - mid_u));
 }
 
 static float envAR(float t, float dur, float attack, float release) {
+  // Attack/Release envelope on top of other loudness/shape modulation.
   if (t < 0.0f) return 0.0f;
   if (t < attack) return (attack > 0.0f) ? (t / attack) : 1.0f;
   float rem = dur - t;
@@ -342,6 +364,8 @@ static inline float oscWaveSample(Osc& osc, uint32_t inc, uint8_t source, float 
 }
 
 static void buildRuntimeCache(const SoundPreset& p) {
+  // All expensive/safety clamping happens once per trigger instead of every
+  // sample in the hot path.
   SynthRuntimeCache& c = g_synth.c;
   c.dur = safeClampf(p.duration_s, 0.005f, 8.0f, 0.2f);
   c.attack = safeClampf(p.attack_s, 0.0f, c.dur, 0.0f);
@@ -403,6 +427,8 @@ static inline void updateRepeatDerivedCache() {
 }
 
 static void resetBurstRuntime(bool resetPhaser, bool resetArp) {
+  // "Burst runtime" can be reset for repeats/retriggers without rebuilding the
+  // full preset cache.
   const SynthRuntimeCache& c = g_synth.c;
   g_synth.retriggerSamples = c.retriggerSamples;
   g_synth.retriggerCounter = 0;
@@ -428,6 +454,8 @@ static void resetBurstRuntime(bool resetPhaser, bool resetArp) {
 }
 
 static inline float applyPhaser(float dry, float u, const SynthRuntimeCache& c) {
+  // Single-tap swept delay phaser, intentionally no feedback to keep CPU and
+  // stability predictable on MCU.
   if (c.phaserMix <= 0.0f) return dry;
 
   const float dMs = lerp(c.phaserDelayStartMs, c.phaserDelayEndMs, clampf(u, 0.0f, 1.0f));
@@ -461,6 +489,7 @@ static void triggerSound(uint8_t id) {
 }
 
 static float synthSample() {
+  // Core synth step for one mono sample. Called by core1 audio producer.
   if (!g_synth.playing) return 0.0f;
 
   if (g_synth.soundId >= PRESET_COUNT) {
@@ -528,6 +557,7 @@ static float synthSample() {
     float s = 0.0f;
 
     if (o.source == SRC_NOISE) {
+      // Noise path has independent HP/LP one-pole states per oscillator.
       const float n = whiteNoise();
       float hpOut = n;
       if (o.hasHp) {
@@ -542,6 +572,7 @@ static float synthSample() {
         s = hpOut;
       }
     } else {
+      // Tonal path: base sweep + integrated slide + shared pitch modulation.
       g_synth.curSlideHzPerS[i] += o.dSlide * dt;
       g_synth.curSlideHzPerS[i] =
           safeClampf(g_synth.curSlideHzPerS[i], -18000.0f, 18000.0f, 0.0f);
@@ -573,6 +604,7 @@ enum AudioCmdType : uint8_t {
 };
 
 static inline uint32_t packAudioCmd(uint8_t cmd, uint8_t arg) {
+  // Single-word command so FIFO handoff is atomic and cheap.
   return ((uint32_t)cmd << 24) | (uint32_t)arg;
 }
 
@@ -585,6 +617,8 @@ static inline uint8_t unpackAudioCmdArg(uint32_t raw) {
 }
 
 static inline uint32_t packAudioUiState(bool playing, uint8_t soundId, uint16_t seq) {
+  // UI state packs (seq,sound,playing) into one volatile write to avoid
+  // torn reads across cores.
   return ((uint32_t)seq << 16) |
          ((uint32_t)soundId << 8) |
          (playing ? 1u : 0u);
@@ -611,6 +645,7 @@ static inline void publishAudioUiState(bool playing, uint8_t soundId, bool force
 }
 
 static bool sendAudioCmd(uint8_t cmd, uint8_t arg = 0) {
+  // Bounded retry loop keeps UI responsive if FIFO is briefly full.
   const uint32_t packed = packAudioCmd(cmd, arg);
   for (int i = 0; i < 200; ++i) {
     if (rp2040.fifo.push_nb(packed)) {
@@ -629,6 +664,8 @@ static void handleAudioCmd(uint32_t raw) {
     case CMD_TRIGGER_SOUND:
       triggerSound(arg);
       ringClear();
+      // New trigger should be audible quickly; start-prime asks producer to
+      // prefill a small startup reservoir.
       g_ringStartPrimeActive = true;
       publishAudioUiState(true, g_synth.soundId);
       break;
@@ -725,6 +762,7 @@ static bool resolveUiActiveSound(uint8_t& soundIdOut) {
   if (seq != g_lastUiObservedSeq) {
     g_lastUiObservedSeq = seq;
     if (audioPlaying && g_pendingUiActive && audioSoundId == g_pendingUiSoundId) {
+      // Core1 acknowledged the trigger we optimistically showed on UI.
       clearPendingUiSound();
     }
   }
@@ -735,6 +773,7 @@ static bool resolveUiActiveSound(uint8_t& soundIdOut) {
   }
 
   if (g_pendingUiActive) {
+    // Short optimistic highlight window hides cross-core command latency.
     const uint32_t elapsed = now - g_pendingUiMs;
     if (elapsed <= UI_PENDING_SOUND_MS && g_pendingUiSoundId < PRESET_COUNT) {
       soundIdOut = g_pendingUiSoundId;
@@ -853,6 +892,7 @@ static void onBtConnect(void*, bool connected) {
   g_btStageStartMs = millis();
   g_lastReconnectAttemptMs = g_btStageStartMs;
   if (connected) {
+    // Re-apply desired volume whenever we establish a new A2DP/AVRCP session.
     g_speakerVolPending = true;
     g_lastSpeakerVolTryMs = 0;
   } else {
@@ -879,6 +919,7 @@ static void startDefaultConnectAttempt(uint32_t nowMs) {
 }
 
 static void startFallbackScan(uint32_t nowMs) {
+  // Simpler synchronous scan path: default MAC first, otherwise first speaker.
   auto devices = bt.scan(BluetoothHCI::speaker_cod, 5, false);
   if (!devices.empty() && bt.connect(devices[0].address())) {
     g_btConnectStage = BT_STAGE_WAIT_FALLBACK;
@@ -901,6 +942,7 @@ static void tickBluetoothConnectFallback(uint32_t nowMs) {
 
     case BT_STAGE_WAIT_DEFAULT:
       if ((nowMs - g_btStageStartMs) >= BT_CONNECT_TIMEOUT_MS) {
+        // Default target did not connect in time; attempt portable fallback.
         startFallbackScan(nowMs);
       }
       break;
@@ -988,6 +1030,7 @@ static void writeRingChunkToBt() {
       p += (size_t)written;
       nbytes -= (size_t)written;
     } else {
+      // Yield briefly so command processing/reconnect can progress.
       processAudioCmdQueue();
       delay(1);
     }
@@ -1013,6 +1056,8 @@ void loop1() {
     return;
   }
 
+  // Non-blocking scheduler: drain to BT first, then top-up ring in bounded
+  // batches (keeps start latency and underrun resistance balanced).
   writeRingChunkToBt();
   processAudioCmdQueue();
 
@@ -1071,6 +1116,7 @@ void loop() {
     if (next != cur) {
       g_speakerVolPct = next;
       g_speakerVolPending = true;
+      // UI shows pending marker until command is accepted / callback arrives.
       g_speakerVolChanged = true;
       uiDirty = true;
     }

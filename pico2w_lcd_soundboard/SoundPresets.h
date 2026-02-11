@@ -77,7 +77,13 @@ struct SoundPreset {
   OscPreset osc[PRESET_OSC_COUNT]; // Fixed oscillator slots.
 };
 
+// Preset order is part of user-facing behavior:
+// - firmware paging/UI maps indices directly to button slots
+// - preset lab sync preserves this ordering
+// Keep names/order stable unless intentionally retuning the soundboard UX.
 static const SoundPreset kSoundPresets[PRESET_COUNT] = {
+  // 1) Natural short chirp cluster. Kept bright but not piercing so it stays
+  // recognizable on small Bluetooth speakers.
   {
     "Bird song",
     0.28f,
@@ -98,6 +104,7 @@ static const SoundPreset kSoundPresets[PRESET_COUNT] = {
       {SRC_SAW, 880.0f, 1950.0f, 0.17f, 0.12f, 0.0f, 0.0f, 0.50f, 0.50f, 120.0f, 40.0f},
     }
   },
+  // 2) Broadband transient + short low body tail.
   {
     "Gunshot",
     0.31f,
@@ -118,6 +125,7 @@ static const SoundPreset kSoundPresets[PRESET_COUNT] = {
       {SRC_NOISE, 0.0f, 0.0f, 0.34f, 0.08f, 1600.0f, 7600.0f, 0.50f, 0.50f, 0.0f, 0.0f},
     }
   },
+  // 3) Low mechanical idle bed intended as "always moving" texture.
   {
     "Engine idle",
     1.85f,
@@ -138,6 +146,7 @@ static const SoundPreset kSoundPresets[PRESET_COUNT] = {
       {SRC_SINE, 32.0f, 28.0f, 0.30f, 0.24f, 0.0f, 0.0f, 0.50f, 0.50f, -4.0f, -1.0f},
     }
   },
+  // 4) Long horn with stacked harmonics and restrained turbulence.
   {
     "Air horn",
     1.30f,
@@ -158,6 +167,7 @@ static const SoundPreset kSoundPresets[PRESET_COUNT] = {
       {SRC_NOISE, 0.0f, 0.0f, 0.05f, 0.01f, 1000.0f, 6200.0f, 0.50f, 0.50f, 0.0f, 0.0f},
     }
   },
+  // 5) Cartoon spring with strong pitch bend and resonant body.
   {
     "Boing spring",
     0.88f,
@@ -178,6 +188,7 @@ static const SoundPreset kSoundPresets[PRESET_COUNT] = {
       {SRC_NOISE, 0.0f, 0.0f, 0.06f, 0.01f, 1400.0f, 8200.0f, 0.50f, 0.50f, 0.0f, 0.0f},
     }
   },
+  // 6) UI/game jump accent with upward contour and quick release.
   {
     "Jump arc",
     0.26f,
@@ -198,6 +209,7 @@ static const SoundPreset kSoundPresets[PRESET_COUNT] = {
       {SRC_NOISE, 0.0f, 0.0f, 0.03f, 0.00f, 2300.0f, 8500.0f, 0.50f, 0.50f, 0.0f, 0.0f},
     }
   },
+  // 7) Positive rise cue.
   {
     "Power up",
     0.48f,
@@ -218,6 +230,7 @@ static const SoundPreset kSoundPresets[PRESET_COUNT] = {
       {SRC_NOISE, 0.0f, 0.0f, 0.02f, 0.00f, 4000.0f, 11000.0f, 0.50f, 0.50f, 0.0f, 0.0f},
     }
   },
+  // 8) Inverse/downward variant of the power cue.
   {
     "Power down",
     0.50f,
@@ -238,6 +251,7 @@ static const SoundPreset kSoundPresets[PRESET_COUNT] = {
       {SRC_NOISE, 0.0f, 0.0f, 0.03f, 0.00f, 3600.0f, 9000.0f, 0.50f, 0.50f, 0.0f, 0.0f},
     }
   },
+  // 9) Long descending whistle, intentionally no terminal impact layer.
   {
     "Falling missile",
     2.45f,
@@ -258,6 +272,7 @@ static const SoundPreset kSoundPresets[PRESET_COUNT] = {
       {SRC_NOISE, 0.0f, 0.0f, 0.03f, 0.01f, 3200.0f, 9600.0f, 0.50f, 0.50f, 0.0f, 0.0f},
     }
   },
+  // 10) Short high-energy zap with aggressive downward sweep.
   {
     "Laser zap",
     0.15f,
@@ -278,6 +293,7 @@ static const SoundPreset kSoundPresets[PRESET_COUNT] = {
       {SRC_SINE, 920.0f, 100.0f, 0.28f, 0.09f, 0.0f, 0.0f, 0.50f, 0.50f, -500.0f, -640.0f},
     }
   },
+  // 11) Multi-pulse weapon burst; repeat block does the cadence.
   {
     "Laser burst",
     0.18f,
@@ -298,6 +314,7 @@ static const SoundPreset kSoundPresets[PRESET_COUNT] = {
       {SRC_SINE, 520.0f, 110.0f, 0.30f, 0.10f, 0.0f, 0.0f, 0.50f, 0.50f, -190.0f, -260.0f},
     }
   },
+  // 12) Extended decay blast for pairing with missile-style presets.
   {
     "Explosion",
     1.05f,
@@ -318,6 +335,7 @@ static const SoundPreset kSoundPresets[PRESET_COUNT] = {
       {SRC_NOISE, 0.0f, 0.0f, 0.34f, 0.10f, 1700.0f, 10800.0f, 0.50f, 0.50f, 0.0f, 0.0f},
     }
   },
+  // 13) Heavier low-frequency machine rumble.
   {
     "Tank rumble",
     3.10f,
@@ -338,6 +356,7 @@ static const SoundPreset kSoundPresets[PRESET_COUNT] = {
       {SRC_SINE, 33.0f, 27.0f, 0.26f, 0.18f, 0.0f, 0.0f, 0.50f, 0.50f, -3.0f, -1.0f},
     }
   },
+  // 14) Rotor-like modulation with mid-low noisy bed.
   {
     "Helicopter",
     2.45f,
@@ -358,6 +377,7 @@ static const SoundPreset kSoundPresets[PRESET_COUNT] = {
       {SRC_NOISE, 0.0f, 0.0f, 0.22f, 0.14f, 130.0f, 2300.0f, 0.50f, 0.50f, 0.0f, 0.0f},
     }
   },
+  // 15) Lower pass-by profile with gradual build and release.
   {
     "Race car",
     2.05f,
@@ -378,6 +398,7 @@ static const SoundPreset kSoundPresets[PRESET_COUNT] = {
       {SRC_NOISE, 0.0f, 0.0f, 0.14f, 0.05f, 60.0f, 2200.0f, 0.50f, 0.50f, 0.0f, 0.0f},
     }
   },
+  // 16) High-frequency tone cluster with subtle movement.
   {
     "Mosquito",
     1.80f,

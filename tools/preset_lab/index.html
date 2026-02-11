@@ -558,6 +558,8 @@
     const MASTER_GAIN = 0.80;
     const MAX_RENDER_SECONDS = 30;
     const SOURCE_TYPES = ["SRC_SINE", "SRC_NOISE", "SRC_SQUARE", "SRC_SAW", "SRC_PULSE"];
+    // Human-facing help text for inspector controls. Keeping labels centralized
+    // here avoids scattering UI copy across control-builder code.
     const TOOLTIP = {
       name: "Display name shown in preset list and copied C++ block.",
       duration_s: "Length of one burst in seconds before repeat logic decides whether to restart.",
@@ -593,6 +595,8 @@
       osc_dslide_hz_per_s2: "Slide acceleration integrated into slide rate.",
     };
 
+    // Canonical starter block shown on first load. This mirrors firmware schema
+    // exactly so parse/format round-trips remain deterministic.
     const DEMO_BLOCK = `{
   {
     "Bird song",
@@ -916,6 +920,8 @@
   },
 };`;
 
+    // Shared sine LUT mirrors firmware strategy (small table + interpolation)
+    // so laptop auditioning stays close to microcontroller output.
     const SINE_LUT = new Int16Array(LUT_LEN);
     for (let i = 0; i < LUT_LEN; i++) {
       const th = (2 * Math.PI * i) / LUT_LEN;
@@ -950,6 +956,8 @@
     };
 
     const app = {
+      // committedPresets: source-of-truth matching editor/export text
+      // stagedPresets: scratch edits for current tuning session
       committedPresets: [],
       stagedPresets: [],
       selectedIndex: 0,
@@ -980,6 +988,7 @@
     }
 
     function phaseIncFromHz(f, sampleRate) {
+      // 32-bit phase accumulator increment.
       return (f * (4294967296.0 / sampleRate)) >>> 0;
     }
 
@@ -1034,6 +1043,8 @@
     }
 
     function resetBurstRuntime(synth, preset, sampleRate, resetPhaser, resetArp) {
+      // Mirrors firmware burst reset: repeats/retriggers can reset oscillator
+      // runtime state without rebuilding the entire preset object.
       const retrigInterval = safeClampf(preset.retrigger.interval_s, 0.0, 2.0, 0.0);
       let retrigSamples = Math.round(retrigInterval * sampleRate);
       if (retrigInterval > 0.0 && retrigSamples === 0) retrigSamples = 1;
@@ -1076,6 +1087,7 @@
     }
 
     function synthSampleStep(synth, preset, sampleRate) {
+      // One mono sample of firmware-parity synth output.
       if (!synth.playing) return 0.0;
 
       const dur = safeClampf(preset.duration_s, 0.005, 8.0, 0.2);
@@ -1248,6 +1260,7 @@
       const out = [];
       const maxSamples = Math.floor(sampleRate * MAX_RENDER_SECONDS);
 
+      // Render until the synth naturally finishes or hard cap is reached.
       while (synth.playing && out.length < maxSamples) {
         let y = synthSampleStep(synth, safePreset, sampleRate);
         y *= MASTER_GAIN;
@@ -1374,6 +1387,7 @@
     }
 
     function formatPresetBlock(presets) {
+      // Canonical formatting is intentionally stable so git diffs are clean.
       const lines = ["{"];
       for (let i = 0; i < presets.length; i++) {
         lines.push(formatPreset(presets[i], i < presets.length - 1));
@@ -1392,6 +1406,8 @@
     }
 
     function tokenize(text) {
+      // Lightweight tokenizer for C++-style initializer snippets. We only need
+      // enough grammar to support the preset schema in SoundPresets.h.
       const tokens = [];
       let i = 0;
       let line = 1;
@@ -1655,6 +1671,8 @@
       }
 
       parsePreset() {
+        // Parse strictly by field order so exported output can preserve exact
+        // firmware struct layout.
         this.expectSymbol("{");
 
         const preset = {
@@ -1851,6 +1869,7 @@
     }
 
     function renderStageStatus() {
+      // Keep apply/reset affordances contextual to selected preset.
       const totalDirty = dirtyCount();
       const selectedDirty = isPresetDirty(app.selectedIndex);
       if (!app.committedPresets.length) {
@@ -1947,6 +1966,8 @@
     }
 
     function wireHoverHelp() {
+      // Tooltip is pointer-driven and only anchored to '?' badges, so normal
+      // inspector interaction remains uncluttered.
       document.addEventListener("pointerover", (ev) => {
         const target = ev.target instanceof Element ? ev.target.closest("[data-help]") : null;
         if (!target) return;
@@ -2009,6 +2030,7 @@
     }, 40);
 
     function onPresetMutated() {
+      // Mutations are staged first, then optionally promoted to committed.
       renderPresetList();
       renderStageStatus();
       queuePreview();
@@ -2237,6 +2259,7 @@
           `Rendered ${pcm.length} samples (${duration.toFixed(3)} s, mono @ ${SR}Hz).`;
 
         if (autoplay && els.autoPreviewToggle.checked) {
+          // Auto-preview is debounced upstream to keep UI responsive.
           await playPCM(pcm, SR);
         }
       } catch (err) {
@@ -2297,6 +2320,7 @@
     }
 
     async function runSelfTests() {
+      // In-app sanity checks: parser round-trip + deterministic render + bounds.
       const lines = [];
       let failed = 0;
 
@@ -2452,6 +2476,7 @@
       });
 
       els.seedInput.addEventListener("change", () => {
+        // Normalize to uint32 so deterministic renders are reproducible.
         const v = Number(els.seedInput.value);
         if (!Number.isFinite(v)) {
           els.seedInput.value = "2779096485";
@@ -2463,6 +2488,7 @@
     }
 
     function init() {
+      // Boot path: load known-good block, parse, then render first preset UI.
       els.editor.value = DEMO_BLOCK;
       wireHoverHelp();
       wireEvents();
