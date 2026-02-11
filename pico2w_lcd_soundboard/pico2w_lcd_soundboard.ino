@@ -34,12 +34,17 @@ constexpr uint32_t BT_RECONNECT_MS = 3000;
 static uint8_t  g_presetWindowStart = 0;
 static uint32_t g_lastReconnectAttemptMs = 0;
 
-static volatile bool g_audioPlaying = false;
-static volatile uint8_t g_audioSoundId = 0;
+static volatile uint32_t g_audioUiState = 0;
 static volatile bool g_streamEnabled = true;
 static volatile bool g_btConnected = false;
 static volatile bool g_btReady = false;
 static volatile bool g_btStateChanged = false;
+
+constexpr uint32_t UI_PENDING_SOUND_MS = 250;
+static bool g_pendingUiActive = false;
+static uint8_t g_pendingUiSoundId = 0;
+static uint32_t g_pendingUiMs = 0;
+static uint16_t g_lastUiObservedSeq = 0;
 
 // ---------------- Small sine LUT + linear interpolation ----------------
 constexpr int      LUT_BITS = 10;             // 1024 entries
@@ -100,8 +105,26 @@ static inline float safeClampf(float x, float a, float b, float fallback) {
   return clampf(x, a, b);
 }
 static inline float lerp(float a, float b, float t)   { return a + (b - a) * t; }
-static inline uint8_t slotToPreset(uint8_t slot) {
-  return (uint8_t)((g_presetWindowStart + slot) % PRESET_COUNT);
+static inline uint8_t presetPageCount() {
+  return (uint8_t)((PRESET_COUNT + SOUND_VIEW_SLOTS - 1u) / SOUND_VIEW_SLOTS);
+}
+static inline int16_t slotToPreset(uint8_t slot) {
+  const uint16_t idx = (uint16_t)g_presetWindowStart + (uint16_t)slot;
+  return (idx < PRESET_COUNT) ? (int16_t)idx : -1;
+}
+static inline void stepPresetWindow(bool forward) {
+  const uint8_t pageCount = presetPageCount();
+  if (pageCount == 0u) {
+    g_presetWindowStart = 0u;
+    return;
+  }
+  uint8_t page = (uint8_t)(g_presetWindowStart / SOUND_VIEW_SLOTS);
+  if (forward) {
+    page = (uint8_t)((page + 1u) % pageCount);
+  } else {
+    page = (uint8_t)((page + pageCount - 1u) % pageCount);
+  }
+  g_presetWindowStart = (uint8_t)(page * SOUND_VIEW_SLOTS);
 }
 static inline float onePoleAlpha(float fc) {
   return clampf((2.0f * (float)M_PI * fc) / (float)SR, 0.0f, 1.0f);
@@ -379,6 +402,32 @@ static inline uint8_t unpackAudioCmdArg(uint32_t raw) {
   return (uint8_t)(raw & 0xFFu);
 }
 
+static inline uint32_t packAudioUiState(bool playing, uint8_t soundId, uint16_t seq) {
+  return ((uint32_t)seq << 16) |
+         ((uint32_t)soundId << 8) |
+         (playing ? 1u : 0u);
+}
+
+static inline void unpackAudioUiState(uint32_t raw, bool& playing, uint8_t& soundId, uint16_t& seq) {
+  playing = (raw & 0x1u) != 0u;
+  soundId = (uint8_t)((raw >> 8) & 0xFFu);
+  seq = (uint16_t)((raw >> 16) & 0xFFFFu);
+}
+
+static uint16_t g_audioUiSeq = 0;
+static bool g_audioUiLastPlaying = false;
+static uint8_t g_audioUiLastSoundId = 0;
+
+static inline void publishAudioUiState(bool playing, uint8_t soundId, bool force = false) {
+  if (!force && playing == g_audioUiLastPlaying && soundId == g_audioUiLastSoundId) {
+    return;
+  }
+  g_audioUiLastPlaying = playing;
+  g_audioUiLastSoundId = soundId;
+  g_audioUiSeq++;
+  g_audioUiState = packAudioUiState(playing, soundId, g_audioUiSeq);
+}
+
 static bool sendAudioCmd(uint8_t cmd, uint8_t arg = 0) {
   const uint32_t packed = packAudioCmd(cmd, arg);
   for (int i = 0; i < 200; ++i) {
@@ -397,14 +446,17 @@ static void handleAudioCmd(uint32_t raw) {
   switch (cmd) {
     case CMD_TRIGGER_SOUND:
       triggerSound(arg);
+      publishAudioUiState(true, g_synth.soundId);
       break;
     case CMD_STOP_SOUND:
       g_synth.playing = false;
+      publishAudioUiState(false, g_synth.soundId);
       break;
     case CMD_STREAM_ENABLE:
       g_streamEnabled = (arg != 0);
       if (!g_streamEnabled) {
         g_synth.playing = false;
+        publishAudioUiState(false, g_synth.soundId);
       }
       break;
     default:
@@ -468,10 +520,51 @@ static uint8_t g_lastUiWindowStart = 0xFF;
 static int8_t g_lastUiActiveRow = -2;
 static uint8_t g_lastUiBtConnected = 0xFF;
 
-static int8_t currentActiveSlot() {
-  if (!g_audioPlaying || g_audioSoundId >= PRESET_COUNT) return -1;
+static inline void clearPendingUiSound() {
+  g_pendingUiActive = false;
+}
+
+static bool resolveUiActiveSound(uint8_t& soundIdOut) {
+  bool audioPlaying = false;
+  uint8_t audioSoundId = 0;
+  uint16_t seq = 0;
+  unpackAudioUiState(g_audioUiState, audioPlaying, audioSoundId, seq);
+
+  const uint32_t now = millis();
+  if (seq != g_lastUiObservedSeq) {
+    g_lastUiObservedSeq = seq;
+    if (audioPlaying && g_pendingUiActive && audioSoundId == g_pendingUiSoundId) {
+      clearPendingUiSound();
+    }
+  }
+
+  if (audioPlaying && audioSoundId < PRESET_COUNT) {
+    soundIdOut = audioSoundId;
+    return true;
+  }
+
+  if (g_pendingUiActive) {
+    const uint32_t elapsed = now - g_pendingUiMs;
+    if (elapsed <= UI_PENDING_SOUND_MS && g_pendingUiSoundId < PRESET_COUNT) {
+      soundIdOut = g_pendingUiSoundId;
+      return true;
+    }
+    clearPendingUiSound();
+  }
+
+  return false;
+}
+
+static int8_t currentActiveSlot(uint8_t* activeSoundId = nullptr) {
+  uint8_t soundId = 0;
+  if (!resolveUiActiveSound(soundId)) {
+    if (activeSoundId) *activeSoundId = 0xFF;
+    return -1;
+  }
+  if (activeSoundId) *activeSoundId = soundId;
   for (uint8_t slot = 0; slot < SOUND_VIEW_SLOTS; ++slot) {
-    if (slotToPreset(slot) == g_audioSoundId) return (int8_t)slot;
+    const int16_t presetIdx = slotToPreset(slot);
+    if (presetIdx >= 0 && (uint8_t)presetIdx == soundId) return (int8_t)slot;
   }
   return -1;
 }
@@ -479,7 +572,9 @@ static int8_t currentActiveSlot() {
 static void renderSoundboardUi(bool force) {
   if (g_lcdFrameBuffer == nullptr) return;
 
-  const int8_t activeSlot = currentActiveSlot();
+  uint8_t activeSoundId = 0xFF;
+  const int8_t activeSlot = currentActiveSlot(&activeSoundId);
+  const bool hasActiveSound = (activeSoundId < PRESET_COUNT);
   const uint8_t btConn = g_btConnected ? 1u : 0u;
   if (!force &&
       g_lastUiWindowStart == g_presetWindowStart &&
@@ -501,8 +596,8 @@ static void renderSoundboardUi(bool force) {
 
   char rangeText[24];
   const uint8_t rangeStart = (uint8_t)(g_presetWindowStart + 1);
-  const uint8_t rangeEnd =
-      (uint8_t)(((g_presetWindowStart + SOUND_VIEW_SLOTS - 1) % PRESET_COUNT) + 1);
+  const uint8_t rangeEnd = (uint8_t)min((uint16_t)PRESET_COUNT,
+                                        (uint16_t)g_presetWindowStart + (uint16_t)SOUND_VIEW_SLOTS);
   snprintf(rangeText, sizeof(rangeText), "%u-%u / %u",
            (unsigned)rangeStart, (unsigned)rangeEnd, (unsigned)PRESET_COUNT);
   UiDrawText(6, 22, rangeText, 0xFFE0, 0x0000);
@@ -511,15 +606,15 @@ static void renderSoundboardUi(bool force) {
   UiDrawText(6, 68, btConn ? "BT: CONNECTED" : "BT: DISCONNECTED",
              btConn ? 0x07E0 : 0xF800, 0x0000);
 
-  if (g_audioPlaying && g_audioSoundId < PRESET_COUNT) {
+  if (hasActiveSound) {
     char nowText[32];
-    snprintf(nowText, sizeof(nowText), "NOW: %s", kSoundPresets[g_audioSoundId].name);
+    snprintf(nowText, sizeof(nowText), "NOW: %s", kSoundPresets[activeSoundId].name);
     UiDrawTextClipped(6, 86, 13, nowText, 0xFFFF, 0x0000);
   }
 
   for (uint8_t row = 0; row < SOUND_VIEW_SLOTS; ++row) {
     const int y = (int)row * rowH;
-    const uint8_t presetIdx = slotToPreset(row);
+    const int16_t presetIdx = slotToPreset(row);
     const bool isActive = ((int8_t)row == activeSlot);
 
     const uint16_t rowBg = isActive ? 0x07E0 : 0x2104;
@@ -530,11 +625,17 @@ static void renderSoundboardUi(bool force) {
 
     char keyText[2] = {kSlotLabel[row], '\0'};
     char idxText[8];
-    snprintf(idxText, sizeof(idxText), "#%u", (unsigned)(presetIdx + 1));
+    if (presetIdx >= 0) {
+      snprintf(idxText, sizeof(idxText), "#%u", (unsigned)((uint8_t)presetIdx + 1u));
+    } else {
+      snprintf(idxText, sizeof(idxText), "--");
+    }
 
     UiDrawText(rightX + 6, y + 8, keyText, rowFg, rowBg);
     UiDrawText(rightX + 6, y + 22, idxText, rowFg, rowBg);
-    UiDrawTextClipped(rightX + 36, y + 18, 18, kSoundPresets[presetIdx].name, rowFg, rowBg);
+    if (presetIdx >= 0) {
+      UiDrawTextClipped(rightX + 36, y + 18, 18, kSoundPresets[(uint8_t)presetIdx].name, rowFg, rowBg);
+    }
   }
 
   LcdWriteToScreen();
@@ -591,8 +692,7 @@ void loop1() {
     if (!g_btConnected) {
       g_synth.playing = false;
     }
-    g_audioPlaying = false;
-    g_audioSoundId = g_synth.soundId;
+    publishAudioUiState(false, g_synth.soundId);
     delay(1);
     return;
   }
@@ -626,8 +726,7 @@ void loop1() {
     }
   }
 
-  g_audioPlaying = g_synth.playing;
-  g_audioSoundId = g_synth.soundId;
+  publishAudioUiState(g_synth.playing, g_synth.soundId);
 }
 
 // ---------------- Arduino Loop (core0) ----------------
@@ -636,6 +735,9 @@ void loop() {
 
   if (g_btStateChanged) {
     g_btStateChanged = false;
+    if (!g_btConnected) {
+      clearPendingUiSound();
+    }
     uiDirty = true;
   }
 
@@ -649,18 +751,50 @@ void loop() {
   }
 
   if (buttonPressed(btnUp)) {
-    g_presetWindowStart = (uint8_t)((g_presetWindowStart + PRESET_COUNT - 1) % PRESET_COUNT);
+    stepPresetWindow(false);
     uiDirty = true;
   }
   if (buttonPressed(btnDown)) {
-    g_presetWindowStart = (uint8_t)((g_presetWindowStart + 1) % PRESET_COUNT);
+    stepPresetWindow(true);
     uiDirty = true;
   }
 
-  if (buttonPressed(btnA)) { sendAudioCmd(CMD_TRIGGER_SOUND, slotToPreset(0)); uiDirty = true; }
-  if (buttonPressed(btnB)) { sendAudioCmd(CMD_TRIGGER_SOUND, slotToPreset(1)); uiDirty = true; }
-  if (buttonPressed(btnX)) { sendAudioCmd(CMD_TRIGGER_SOUND, slotToPreset(2)); uiDirty = true; }
-  if (buttonPressed(btnY)) { sendAudioCmd(CMD_TRIGGER_SOUND, slotToPreset(3)); uiDirty = true; }
+  if (buttonPressed(btnA)) {
+    const int16_t idx = slotToPreset(0);
+    if (idx >= 0 && sendAudioCmd(CMD_TRIGGER_SOUND, (uint8_t)idx)) {
+      g_pendingUiActive = true;
+      g_pendingUiSoundId = (uint8_t)idx;
+      g_pendingUiMs = millis();
+      uiDirty = true;
+    }
+  }
+  if (buttonPressed(btnB)) {
+    const int16_t idx = slotToPreset(1);
+    if (idx >= 0 && sendAudioCmd(CMD_TRIGGER_SOUND, (uint8_t)idx)) {
+      g_pendingUiActive = true;
+      g_pendingUiSoundId = (uint8_t)idx;
+      g_pendingUiMs = millis();
+      uiDirty = true;
+    }
+  }
+  if (buttonPressed(btnX)) {
+    const int16_t idx = slotToPreset(2);
+    if (idx >= 0 && sendAudioCmd(CMD_TRIGGER_SOUND, (uint8_t)idx)) {
+      g_pendingUiActive = true;
+      g_pendingUiSoundId = (uint8_t)idx;
+      g_pendingUiMs = millis();
+      uiDirty = true;
+    }
+  }
+  if (buttonPressed(btnY)) {
+    const int16_t idx = slotToPreset(3);
+    if (idx >= 0 && sendAudioCmd(CMD_TRIGGER_SOUND, (uint8_t)idx)) {
+      g_pendingUiActive = true;
+      g_pendingUiSoundId = (uint8_t)idx;
+      g_pendingUiMs = millis();
+      uiDirty = true;
+    }
+  }
 
   renderSoundboardUi(uiDirty);
   delay(1);

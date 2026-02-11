@@ -31,3 +31,15 @@ Open `http://localhost:8080`.
 - Parser scope is the preset array block only (or snippet containing `kSoundPresets`).
 - No firmware build/flash automation is included.
 - The app is local-only and uses no external dependencies.
+
+## Sync Script
+
+Use the helper to keep firmware and lab demo block aligned:
+
+```bash
+# firmware SoundPresets.h -> lab DEMO_BLOCK
+python3 tools/preset_lab/sync_presets.py fw-to-lab
+
+# lab DEMO_BLOCK -> firmware SoundPresets.h (also updates PRESET_COUNT)
+python3 tools/preset_lab/sync_presets.py lab-to-fw
+```
