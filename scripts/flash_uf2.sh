@@ -19,7 +19,7 @@ if [ ! -f "$UF2_PATH" ]; then
 fi
 
 if ! MOUNT_PATH="$(detect_boot_mount)"; then
-  echo "FLASH:SKIPPED no RPI-RP2 mount found"
+  echo "FLASH:SKIPPED no RPI-RP2/RP2350 mount found"
   exit 0
 fi
 

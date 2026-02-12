@@ -19,6 +19,7 @@ static const Glyph5x7 kGlyphs[] = {
   {'-', {0x00, 0x00, 0x00, 0x1F, 0x00, 0x00, 0x00}},
   {'/', {0x01, 0x02, 0x04, 0x08, 0x10, 0x00, 0x00}},
   {':', {0x00, 0x04, 0x00, 0x00, 0x04, 0x00, 0x00}},
+  {',', {0x00, 0x00, 0x00, 0x00, 0x06, 0x06, 0x04}},
   {'.', {0x00, 0x00, 0x00, 0x00, 0x00, 0x06, 0x06}},
   {'?', {0x0E, 0x11, 0x01, 0x02, 0x04, 0x00, 0x04}},
   {'0', {0x0E, 0x11, 0x13, 0x15, 0x19, 0x11, 0x0E}},
@@ -64,6 +65,14 @@ static uint16_t* sFb = nullptr;
 static int sWidth = 0;
 static int sHeight = 0;
 
+constexpr int kGlyphW = 5;
+constexpr int kGlyphH = 7;
+constexpr int kCellW = 6;
+constexpr int kCellH = 8;
+constexpr int kLargeScale = 2;
+constexpr int kMediumScale = 3;
+constexpr int kGiantScale = 7;
+
 static inline uint16_t lcdColor(uint16_t color) {
   // Waveshare ST7789 path expects byte-swapped 16-bit RGB565 in memory.
   return (uint16_t)(((color << 8) & 0xFF00u) | ((color >> 8) & 0x00FFu));
@@ -102,19 +111,36 @@ static const uint8_t* glyphFor(char ch) {
   return nullptr;
 }
 
-static void drawChar(int x, int y, char ch, uint16_t fg, uint16_t bg) {
+static void drawCharScaled(int x, int y, char ch, uint16_t fg, uint16_t bg, int scale) {
+  if (scale <= 0) return;
   const uint8_t* g = glyphFor(ch);
   if (!g) return;
 
-  for (int ry = 0; ry < 8; ++ry) {
-    for (int rx = 0; rx < 6; ++rx) {
-      // Draw in a 6x8 cell so text has built-in inter-character spacing.
+  const int cellW = kCellW * scale;
+  const int cellH = kCellH * scale;
+  for (int ry = 0; ry < cellH; ++ry) {
+    const int gy = ry / scale;
+    for (int rx = 0; rx < cellW; ++rx) {
+      const int gx = rx / scale;
+      // Draw in a 6x8 cell (scaled) so text has built-in inter-character spacing.
       bool on = false;
-      if (ry < 7 && rx < 5) {
-        on = (g[ry] & (1u << (4 - rx))) != 0;
+      if (gy < kGlyphH && gx < kGlyphW) {
+        on = (g[gy] & (1u << (kGlyphW - 1 - gx))) != 0;
       }
       putPixel(x + rx, y + ry, on ? fg : bg);
     }
+  }
+}
+
+static void drawTextScaled(int x, int y, const char* s, uint16_t fg, uint16_t bg, int scale) {
+  if (!sFb || !s) return;
+  const uint16_t f = lcdColor(fg);
+  const uint16_t b = lcdColor(bg);
+  int cx = x;
+  const int advance = kCellW * scale;
+  for (size_t i = 0; s[i] != '\0'; ++i) {
+    drawCharScaled(cx, y, s[i], f, b, scale);
+    cx += advance;
   }
 }
 
@@ -157,15 +183,19 @@ void UiDrawRect(int x, int y, int w, int h, uint16_t color) {
 }
 
 void UiDrawText(int x, int y, const char* s, uint16_t fg, uint16_t bg) {
-  if (!sFb || !s) return;
-  const uint16_t f = lcdColor(fg);
-  const uint16_t b = lcdColor(bg);
-  int cx = x;
-  for (size_t i = 0; s[i] != '\0'; ++i) {
-    drawChar(cx, y, s[i], f, b);
-    // Fixed advance that matches drawChar() cell width.
-    cx += 6;
-  }
+  drawTextScaled(x, y, s, fg, bg, 1);
+}
+
+void UiDrawTextLarge(int x, int y, const char* s, uint16_t fg, uint16_t bg) {
+  drawTextScaled(x, y, s, fg, bg, kLargeScale);
+}
+
+void UiDrawTextMedium(int x, int y, const char* s, uint16_t fg, uint16_t bg) {
+  drawTextScaled(x, y, s, fg, bg, kMediumScale);
+}
+
+void UiDrawTextGiant(int x, int y, const char* s, uint16_t fg, uint16_t bg) {
+  drawTextScaled(x, y, s, fg, bg, kGiantScale);
 }
 
 void UiDrawTextClipped(int x, int y, int maxChars, const char* s, uint16_t fg, uint16_t bg) {

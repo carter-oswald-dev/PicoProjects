@@ -22,6 +22,12 @@ add_custom_target(build_pico_lcd_generative_art
   USES_TERMINAL
 )
 
+add_custom_target(build_kitchen_wall_clock
+  COMMAND ${REPO_ROOT}/scripts/build.sh --project kitchen_wall_clock --no-flash
+  WORKING_DIRECTORY ${REPO_ROOT}
+  USES_TERMINAL
+)
+
 add_custom_target(build_all
   COMMAND ${REPO_ROOT}/scripts/build.sh --all --no-flash
   WORKING_DIRECTORY ${REPO_ROOT}

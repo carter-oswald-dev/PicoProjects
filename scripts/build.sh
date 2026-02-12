@@ -15,6 +15,7 @@ Projects:
   creepy_halloween_sonar
   pico2w_lcd_soundboard
   pico_lcd_generative_art
+  kitchen_wall_clock
 USAGE
 }
 
@@ -62,9 +63,10 @@ if [ "$ALL" -eq 1 ]; then
   build_one "creepy_halloween_sonar"
   build_one "pico2w_lcd_soundboard"
   build_one "pico_lcd_generative_art"
+  build_one "kitchen_wall_clock"
 else
   case "$PROJECT" in
-    creepy_halloween_sonar|pico2w_lcd_soundboard|pico_lcd_generative_art)
+    creepy_halloween_sonar|pico2w_lcd_soundboard|pico_lcd_generative_art|kitchen_wall_clock)
       build_one "$PROJECT"
       ;;
     *)

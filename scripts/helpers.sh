@@ -130,8 +130,11 @@ detect_boot_mount() {
   local mount
   for mount in \
     "/Volumes/RPI-RP2" \
+    "/Volumes/RP2350" \
     "/media/${user_name}/RPI-RP2" \
-    "/run/media/${user_name}/RPI-RP2"
+    "/media/${user_name}/RP2350" \
+    "/run/media/${user_name}/RPI-RP2" \
+    "/run/media/${user_name}/RP2350"
   do
     if [ -d "$mount" ]; then
       printf '%s\n' "$mount"

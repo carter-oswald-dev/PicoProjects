@@ -52,6 +52,9 @@ uf2_for_project() {
     pico_lcd_generative_art)
       printf '%s\n' "$ROOT_DIR/.build/pico_lcd_generative_art/GenerativeArt.uf2"
       ;;
+    kitchen_wall_clock)
+      printf '%s\n' "$ROOT_DIR/.build/kitchen_wall_clock/kitchen_wall_clock.ino.uf2"
+      ;;
     *)
       return 1
       ;;
@@ -90,7 +93,7 @@ run_smoke_for_project() {
   fi
 
   if ! MOUNT_PATH="$(detect_boot_mount)"; then
-    echo "SMOKE:$project:SKIPPED no RPI-RP2 boot mount detected"
+    echo "SMOKE:$project:SKIPPED no RPI-RP2/RP2350 boot mount detected"
     return
   fi
 
@@ -141,9 +144,10 @@ if [ "$ALL" -eq 1 ]; then
   run_smoke_for_project creepy_halloween_sonar
   run_smoke_for_project pico2w_lcd_soundboard
   run_smoke_for_project pico_lcd_generative_art
+  run_smoke_for_project kitchen_wall_clock
 else
   case "$PROJECT" in
-    creepy_halloween_sonar|pico2w_lcd_soundboard|pico_lcd_generative_art)
+    creepy_halloween_sonar|pico2w_lcd_soundboard|pico_lcd_generative_art|kitchen_wall_clock)
       run_smoke_for_project "$PROJECT"
       ;;
     *)
