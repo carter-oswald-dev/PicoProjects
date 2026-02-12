@@ -107,6 +107,21 @@ def sync_lab_to_fw(fw_path: Path, lab_path: Path) -> None:
     print(f"Synced lab -> firmware ({preset_count} presets).")
 
 
+def find_repo_root(start: Path) -> Path:
+    cur = start.resolve()
+    if cur.is_file():
+        cur = cur.parent
+
+    while True:
+        if (cur / "AGENTS.md").is_file() and (cur / "projects").is_dir():
+            return cur
+        if cur.parent == cur:
+            raise RuntimeError(
+                "Could not infer repository root. Provide --repo-root, or explicit --fw-path and --lab-path."
+            )
+        cur = cur.parent
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Sync Pico sound presets between firmware and lab.")
     parser.add_argument(
@@ -116,15 +131,28 @@ def main() -> int:
     )
     parser.add_argument(
         "--repo-root",
-        default=Path(__file__).resolve().parents[2],
         type=Path,
-        help="Repository root path (default: inferred).",
+        help="Repository root path (if omitted, inferred from this script location).",
+    )
+    parser.add_argument(
+        "--fw-path",
+        type=Path,
+        help="Override firmware SoundPresets.h path.",
+    )
+    parser.add_argument(
+        "--lab-path",
+        type=Path,
+        help="Override lab index.html path.",
     )
     args = parser.parse_args()
 
-    root = args.repo_root.resolve()
-    fw_path = root / "pico2w_lcd_soundboard" / "SoundPresets.h"
-    lab_path = root / "tools" / "preset_lab" / "index.html"
+    root = args.repo_root.resolve() if args.repo_root else find_repo_root(Path(__file__))
+    fw_path = args.fw_path.resolve() if args.fw_path else root / "projects" / "pico2w_lcd_soundboard" / "SoundPresets.h"
+    lab_path = (
+        args.lab_path.resolve()
+        if args.lab_path
+        else root / "projects" / "pico2w_lcd_soundboard" / "tools" / "preset_lab" / "index.html"
+    )
 
     if not fw_path.is_file():
         raise RuntimeError(f"Missing firmware presets file: {fw_path}")

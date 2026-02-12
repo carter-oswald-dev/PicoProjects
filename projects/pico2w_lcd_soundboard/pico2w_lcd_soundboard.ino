@@ -3,7 +3,7 @@
  *
  * Target: Raspberry Pi Pico 2W (Arduino-Pico core by Earle Philhower)
  * Audio:  A2DP Source via BluetoothAudio.h (streams synthesized audio)
- * Display: Initialized through LcdDriver.c/.h (from PicoLcdGenerativeArt)
+ * Display: Initialized through shared/pico_display LcdDriver + UiText helpers
  */
 
 #include <Arduino.h>

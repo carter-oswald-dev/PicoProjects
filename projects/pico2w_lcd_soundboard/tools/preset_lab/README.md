@@ -7,12 +7,12 @@ Local web app for designing `kSoundPresets` with immediate audio feedback on lap
 - Parses the C++ `kSoundPresets` initializer block.
 - Mirrors the firmware synth engine (LFO, repeat, retrigger, arp jump, noise filtering, phaser).
 - Lets you tweak parameters and audition instantly.
-- Exports canonical C++ initializer text you can paste into `pico2w_lcd_soundboard/SoundPresets.h`.
+- Exports canonical C++ initializer text you can paste into `projects/pico2w_lcd_soundboard/SoundPresets.h`.
 
 ## Run
 
 ```bash
-cd tools/preset_lab
+cd projects/pico2w_lcd_soundboard/tools/preset_lab
 python3 -m http.server 8080
 ```
 
@@ -38,8 +38,8 @@ Use the helper to keep firmware and lab demo block aligned:
 
 ```bash
 # firmware SoundPresets.h -> lab DEMO_BLOCK
-python3 tools/preset_lab/sync_presets.py fw-to-lab
+python3 projects/pico2w_lcd_soundboard/tools/preset_lab/sync_presets.py fw-to-lab
 
 # lab DEMO_BLOCK -> firmware SoundPresets.h (also updates PRESET_COUNT)
-python3 tools/preset_lab/sync_presets.py lab-to-fw
+python3 projects/pico2w_lcd_soundboard/tools/preset_lab/sync_presets.py lab-to-fw
 ```

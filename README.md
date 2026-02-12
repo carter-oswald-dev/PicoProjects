@@ -1,36 +1,96 @@
 # PicoProjects
 
-Arduino CLI projects for Raspberry Pi Pico boards.
+Hybrid Arduino + Pico SDK monorepo for Raspberry Pi Pico W / Pico 2W projects.
 
-## Projects
+## Repository Layout
 
-- `creepy_halloween_sonar/` - Bluetooth creepy sonar tone generator (Pico W)
-- `pico2w_lcd_soundboard/` - LCD 4-button Bluetooth soundboard (Pico 2W)
+- `projects/`
+  - `creepy_halloween_sonar/` (Arduino / `arduino-cli`)
+  - `pico2w_lcd_soundboard/` (Arduino / `arduino-cli`)
+  - `pico_lcd_generative_art/` (Pico SDK / CMake)
+- `shared/`
+  - `pico_display/` shared LCD driver + text rendering code (buildable by both toolchains)
+- `scripts/`
+  - root build/verify/flash/doctor/smoke helpers
 
-## Build
+## Build Commands
 
-Use the helper script:
+### Build all projects (default)
 
 ```bash
-./scripts/build.sh
-./pico2w_lcd_soundboard/build.sh
+./scripts/build.sh --all
 ```
 
-Build outputs are written to `.build/<project-name>/`.
-
-## Preset Lab
-
-For laptop-side preset tuning with immediate audio feedback:
+### Build one project
 
 ```bash
-cd tools/preset_lab
+./scripts/build.sh --project creepy_halloween_sonar
+./scripts/build.sh --project pico2w_lcd_soundboard
+./scripts/build.sh --project pico_lcd_generative_art
+```
+
+### Build without flashing
+
+```bash
+./scripts/build.sh --all --no-flash
+```
+
+### Per-project build entrypoints
+
+```bash
+./projects/creepy_halloween_sonar/build.sh
+./projects/pico2w_lcd_soundboard/build.sh
+./projects/pico_lcd_generative_art/build.sh
+```
+
+## Verify / Smoke / Doctor
+
+```bash
+./scripts/doctor.sh
+./scripts/verify.sh --all
+./scripts/smoke.sh --project pico_lcd_generative_art
+```
+
+- `verify.sh` runs prerequisite checks, builds, preset sync regression, then smoke checks.
+- `smoke.sh` reports `PASS` or explicit `SKIPPED` when hardware is unavailable.
+
+## Root CMake Superbuild
+
+```bash
+cmake -S . -B .build/root
+cmake --build .build/root --target build_all
+cmake --build .build/root --target verify_all
+```
+
+Available CMake targets:
+- `build_creepy_halloween_sonar`
+- `build_pico2w_lcd_soundboard`
+- `build_pico_lcd_generative_art`
+- `build_all`
+- `verify_all`
+
+## Preset Lab (Soundboard)
+
+```bash
+cd projects/pico2w_lcd_soundboard/tools/preset_lab
 python3 -m http.server 8080
 ```
 
-Then open `http://localhost:8080`.
+Sync helper:
 
-## Requirements
+```bash
+python3 projects/pico2w_lcd_soundboard/tools/preset_lab/sync_presets.py fw-to-lab
+python3 projects/pico2w_lcd_soundboard/tools/preset_lab/sync_presets.py lab-to-fw
+```
 
-- `arduino-cli` available in `PATH`, or Arduino IDE installed at:
-  `/Applications/Arduino IDE.app/Contents/Resources/app/lib/backend/resources/arduino-cli`
-- Arduino-Pico core installed: `rp2040:rp2040`
+## Flashing Behavior
+
+When build scripts run without `--no-flash`, they attempt UF2 copy to:
+- macOS: `/Volumes/RPI-RP2`
+- Linux: `/media/$USER/RPI-RP2` or `/run/media/$USER/RPI-RP2`
+
+If no mount is present, flashing is skipped and reported.
+
+## Shared Change Policy
+
+If files under `shared/` change, rebuild all dependent projects (prefer `./scripts/build.sh --all` or `./scripts/verify.sh --all`).

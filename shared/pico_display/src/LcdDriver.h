@@ -2,15 +2,6 @@
 #define LCD_DRIVER_H
 
 #include <stdint.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include "pico/stdio.h"
-#include "pico/stdlib.h"
-#include "hardware/spi.h"
-#include "hardware/gpio.h"
-#include "hardware/pwm.h"
-
-#define SPI_PORT        spi1
 
 #define LCD_DC_PIN      8
 #define LCD_CS_PIN      9

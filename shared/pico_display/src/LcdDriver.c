@@ -1,5 +1,15 @@
 #include "LcdDriver.h"
 
+#include <stdio.h>
+
+#include "hardware/gpio.h"
+#include "hardware/pwm.h"
+#include "hardware/spi.h"
+#include "pico/stdio.h"
+#include "pico/stdlib.h"
+
+#define SPI_PORT spi1
+
 uint8_t slice_num;
 
 struct screen_attr_struct {
@@ -8,7 +18,10 @@ struct screen_attr_struct {
     uint8_t scan_dir;
 } screen_attr;
 
-uint16_t *frame_buffer = NULL;
+// Static framebuffer avoids heap use and keeps behavior deterministic on both
+// Arduino and Pico SDK builds.
+static uint16_t frame_buffer_storage[SCREEN_WIDTH_HEIGHT * SCREEN_WIDTH_HEIGHT];
+uint16_t *frame_buffer = frame_buffer_storage;
 uint16_t image_size = 0;
 
 // Internal function prototypes
@@ -83,13 +96,9 @@ uint16_t *LcdDisplayInit(uint8_t scan_dir) {
     screen_attr.height = SCREEN_WIDTH_HEIGHT;
     uint8_t memory_access_reg;
 
-    if (frame_buffer != NULL) {
-        free(frame_buffer);
-        frame_buffer = NULL;
-    }
     image_size = screen_attr.width * screen_attr.height;
-    // One RGB565 word per pixel.
-    frame_buffer = (uint16_t *)malloc(image_size * 2);
+    // One RGB565 word per pixel in static storage.
+    frame_buffer = frame_buffer_storage;
 
     // MADCTL bits differ by scan direction.
     if(scan_dir == SCAN_DIR_HORIZONTAL) {
