@@ -30,6 +30,8 @@ UF2 output:
 
 ## Preset Lab
 
+This local web tool is used to view, edit, and play preset sounds before syncing them to firmware.
+
 Local preset editor lives under:
 - `projects/pico2w_lcd_soundboard/tools/preset_lab/`
 

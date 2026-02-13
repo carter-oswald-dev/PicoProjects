@@ -13,5 +13,9 @@ void UiDrawTextLarge(int x, int y, const char* s, uint16_t fg, uint16_t bg);
 void UiDrawTextMedium(int x, int y, const char* s, uint16_t fg, uint16_t bg);
 void UiDrawTextGiant(int x, int y, const char* s, uint16_t fg, uint16_t bg);
 void UiDrawTextClipped(int x, int y, int maxChars, const char* s, uint16_t fg, uint16_t bg);
+int UiTextWidth(const char* s);
+int UiTextWidthLarge(const char* s);
+int UiTextWidthMedium(const char* s);
+int UiTextWidthGiant(const char* s);
 
 #endif // UI_TEXT_H

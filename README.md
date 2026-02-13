@@ -73,20 +73,6 @@ Available CMake targets:
 - `build_all`
 - `verify_all`
 
-## Preset Lab (Soundboard)
-
-```bash
-cd projects/pico2w_lcd_soundboard/tools/preset_lab
-python3 -m http.server 8080
-```
-
-Sync helper:
-
-```bash
-python3 projects/pico2w_lcd_soundboard/tools/preset_lab/sync_presets.py fw-to-lab
-python3 projects/pico2w_lcd_soundboard/tools/preset_lab/sync_presets.py lab-to-fw
-```
-
 ## Flashing Behavior
 
 When build scripts run without `--no-flash`, they attempt UF2 copy to:

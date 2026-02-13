@@ -22,7 +22,25 @@ constexpr uint16_t kColorBg = 0x0000;
 constexpr uint16_t kColorFg = 0xFFFF;
 constexpr uint16_t kColorAccent = 0x07FF;
 constexpr uint16_t kColorWarn = 0xFFE0;
-constexpr uint16_t kColorError = 0xF800;
+constexpr uint16_t kColorTemp = 0xFD20;
+constexpr uint16_t kColorLow = 0x06DF;
+constexpr uint16_t kColorHigh = 0xF800;
+constexpr uint16_t kColorSun = 0xFFE0;
+constexpr uint16_t kColorCloud = 0xC618;
+constexpr uint16_t kColorRain = 0x05FF;
+constexpr uint16_t kColorSnow = 0xC73F;
+
+constexpr char kGlyphTemp = '&';
+constexpr char kGlyphDegree = '*';
+constexpr char kGlyphLow = '[';
+constexpr char kGlyphHigh = ']';
+constexpr char kGlyphClear = '+';
+constexpr char kGlyphPartlyCloudy = ';';
+constexpr char kGlyphCloudy = '=';
+constexpr char kGlyphRain = '"';
+constexpr char kGlyphSnow = '$';
+constexpr char kGlyphFog = '~';
+constexpr char kGlyphThunder = '!';
 
 constexpr const char kTzPacific[] = "PST8PDT,M3.2.0/2,M11.1.0/2";
 
@@ -90,6 +108,77 @@ const char* weather_code_text(int code) {
     default:
       return "UNKNOWN";
   }
+}
+
+char weather_code_glyph(int code) {
+  switch (code) {
+    case 0:
+      return kGlyphClear;
+    case 1:
+    case 2:
+      return kGlyphPartlyCloudy;
+    case 3:
+      return kGlyphCloudy;
+    case 45:
+    case 48:
+      return kGlyphFog;
+    case 51:
+    case 53:
+    case 55:
+    case 61:
+    case 63:
+    case 65:
+    case 80:
+    case 81:
+    case 82:
+      return kGlyphRain;
+    case 71:
+    case 73:
+    case 75:
+      return kGlyphSnow;
+    case 95:
+      return kGlyphThunder;
+    default:
+      return '?';
+  }
+}
+
+uint16_t weather_code_glyph_color(int code) {
+  switch (code) {
+    case 0:
+    case 1:
+    case 2:
+      return kColorSun;
+    case 3:
+    case 45:
+    case 48:
+      return kColorCloud;
+    case 71:
+    case 73:
+    case 75:
+      return kColorSnow;
+    case 51:
+    case 53:
+    case 55:
+    case 61:
+    case 63:
+    case 65:
+    case 80:
+    case 81:
+    case 82:
+    case 95:
+      return kColorRain;
+    default:
+      return kColorWarn;
+  }
+}
+
+int centered_x_for_width(int width_px) {
+  const int display_width = SCREEN_WIDTH_HEIGHT;
+  if (width_px <= 0 || width_px >= display_width) {
+    return 0;
+  }
+  return (display_width - width_px) / 2;
 }
 
 int rounded_temp(float t) {
@@ -382,16 +471,73 @@ void draw_screen() {
   }
 
   if (g_app.weather.valid) {
-    snprintf(line, sizeof(line), "%dC  %d/%dC",
-             rounded_temp(g_app.weather.temp_c),
-             rounded_temp(g_app.weather.min_c),
-             rounded_temp(g_app.weather.max_c));
-    UiDrawTextMedium(12, 150, line, kColorFg, kColorBg);
+    const int temp_now = rounded_temp(g_app.weather.temp_c);
+    const int temp_low = rounded_temp(g_app.weather.min_c);
+    const int temp_high = rounded_temp(g_app.weather.max_c);
+    const int weather_y = 150;
 
-    snprintf(line, sizeof(line), "%s", weather_code_text(g_app.weather.weather_code));
-    UiDrawTextLarge(12, 188, line, g_app.weather.stale ? kColorWarn : kColorFg, kColorBg);
+    char temp_icon[2] = {kGlyphTemp, '\0'};
+    char degree_icon[2] = {kGlyphDegree, '\0'};
+    char low_icon[2] = {kGlyphLow, '\0'};
+    char high_icon[2] = {kGlyphHigh, '\0'};
+    char now_str[8];
+    char low_str[8];
+    char high_str[8];
+    snprintf(now_str, sizeof(now_str), "%d", temp_now);
+    snprintf(low_str, sizeof(low_str), "%d", temp_low);
+    snprintf(high_str, sizeof(high_str), "%d", temp_high);
+
+    const int segment_gap = UiTextWidthMedium(" ") / 2;
+    const int total_temp_width =
+        UiTextWidthMedium(temp_icon) +
+        UiTextWidthMedium(now_str) +
+        UiTextWidthMedium(degree_icon) +
+        segment_gap +
+        UiTextWidthMedium(low_icon) +
+        UiTextWidthMedium(low_str) +
+        segment_gap +
+        UiTextWidthMedium(high_icon) +
+        UiTextWidthMedium(high_str);
+
+    int x = centered_x_for_width(total_temp_width);
+
+    UiDrawTextMedium(x, weather_y, temp_icon, kColorTemp, kColorBg);
+    x += UiTextWidthMedium(temp_icon);
+    UiDrawTextMedium(x, weather_y, now_str, kColorTemp, kColorBg);
+    x += UiTextWidthMedium(now_str);
+    UiDrawTextMedium(x, weather_y, degree_icon, kColorTemp, kColorBg);
+    x += UiTextWidthMedium(degree_icon);
+    x += segment_gap;
+    UiDrawTextMedium(x, weather_y, low_icon, kColorLow, kColorBg);
+    x += UiTextWidthMedium(low_icon);
+    UiDrawTextMedium(x, weather_y, low_str, kColorLow, kColorBg);
+    x += UiTextWidthMedium(low_str);
+    x += segment_gap;
+    UiDrawTextMedium(x, weather_y, high_icon, kColorHigh, kColorBg);
+    x += UiTextWidthMedium(high_icon);
+    UiDrawTextMedium(x, weather_y, high_str, kColorHigh, kColorBg);
+
+    char icon[2] = {weather_code_glyph(g_app.weather.weather_code), '\0'};
+    const char* condition_text = weather_code_text(g_app.weather.weather_code);
+    const int condition_gap = UiTextWidthLarge(" ") / 2;
+    const int total_condition_width =
+        UiTextWidthLarge(icon) + condition_gap + UiTextWidthLarge(condition_text);
+    const int condition_x = centered_x_for_width(total_condition_width);
+    const uint16_t condition_icon_color = g_app.weather.stale
+        ? kColorWarn
+        : weather_code_glyph_color(g_app.weather.weather_code);
+    UiDrawTextLarge(condition_x, 188, icon, condition_icon_color, kColorBg);
+    UiDrawTextLarge(condition_x + UiTextWidthLarge(icon) + condition_gap, 188,
+                    condition_text,
+                    g_app.weather.stale ? kColorWarn : kColorFg, kColorBg);
   } else {
-    UiDrawTextLarge(12, 188, "WX UNAVAILABLE", kColorWarn, kColorBg);
+    const int condition_gap = UiTextWidthLarge(" ") / 2;
+    const int total_condition_width =
+        UiTextWidthLarge("?") + condition_gap + UiTextWidthLarge("WX UNAVAILABLE");
+    const int condition_x = centered_x_for_width(total_condition_width);
+    UiDrawTextLarge(condition_x, 188, "?", kColorWarn, kColorBg);
+    UiDrawTextLarge(condition_x + UiTextWidthLarge("?") + condition_gap, 188,
+                    "WX UNAVAILABLE", kColorWarn, kColorBg);
   }
 
   if (!wifi_credentials_configured()) {
