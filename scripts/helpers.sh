@@ -78,6 +78,7 @@ detect_arm_gcc_bin() {
   local candidate
 
   for base in \
+    "$HOME/.pico-sdk/toolchain" \
     "$HOME/Library/Arduino15/packages/rp2040/tools/pqt-gcc" \
     "$HOME/.arduino15/packages/rp2040/tools/pqt-gcc"
   do
@@ -107,12 +108,13 @@ detect_picotool_bin() {
   local candidate
 
   for base in \
+    "$HOME/.pico-sdk/picotool" \
     "$HOME/Library/Arduino15/packages/rp2040/tools/pqt-picotool" \
     "$HOME/.arduino15/packages/rp2040/tools/pqt-picotool"
   do
     [ -d "$base" ] || continue
     latest=""
-    for candidate in "$base"/*/picotool; do
+    for candidate in "$base"/*/picotool "$base"/*/picotool/picotool; do
       [ -x "$candidate" ] || continue
       latest="$candidate"
     done

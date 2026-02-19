@@ -1,0 +1,8 @@
+.program squarewave
+; Toggle a single pin high then low forever.
+; One full output cycle = 2 instructions.
+
+.wrap_target
+    set pins, 1
+    set pins, 0
+.wrap

@@ -8,6 +8,7 @@ Hybrid Arduino + Pico SDK monorepo for Raspberry Pi Pico W / Pico 2W projects.
   - `creepy_halloween_sonar/` (Arduino / `arduino-cli`)
   - `pico2w_lcd_soundboard/` (Arduino / `arduino-cli`)
   - `pico_lcd_generative_art/` (Pico SDK / CMake)
+  - `pico_am_radio/` (Pico SDK / CMake)
   - `kitchen_wall_clock/` (Arduino / `arduino-cli`)
 - `shared/`
   - `pico_display/` shared LCD driver + text rendering code (buildable by both toolchains)
@@ -28,6 +29,7 @@ Hybrid Arduino + Pico SDK monorepo for Raspberry Pi Pico W / Pico 2W projects.
 ./scripts/build.sh --project creepy_halloween_sonar
 ./scripts/build.sh --project pico2w_lcd_soundboard
 ./scripts/build.sh --project pico_lcd_generative_art
+./scripts/build.sh --project pico_am_radio
 ./scripts/build.sh --project kitchen_wall_clock
 ```
 
@@ -43,6 +45,7 @@ Hybrid Arduino + Pico SDK monorepo for Raspberry Pi Pico W / Pico 2W projects.
 ./projects/creepy_halloween_sonar/build.sh
 ./projects/pico2w_lcd_soundboard/build.sh
 ./projects/pico_lcd_generative_art/build.sh
+./projects/pico_am_radio/build.sh
 ./projects/kitchen_wall_clock/build.sh
 ```
 
@@ -69,6 +72,7 @@ Available CMake targets:
 - `build_creepy_halloween_sonar`
 - `build_pico2w_lcd_soundboard`
 - `build_pico_lcd_generative_art`
+- `build_pico_am_radio`
 - `build_kitchen_wall_clock`
 - `build_all`
 - `verify_all`

@@ -52,6 +52,9 @@ uf2_for_project() {
     pico_lcd_generative_art)
       printf '%s\n' "$ROOT_DIR/.build/pico_lcd_generative_art/GenerativeArt.uf2"
       ;;
+    pico_am_radio)
+      printf '%s\n' "$ROOT_DIR/.build/pico_am_radio/PicoAM.uf2"
+      ;;
     kitchen_wall_clock)
       printf '%s\n' "$ROOT_DIR/.build/kitchen_wall_clock/kitchen_wall_clock.ino.uf2"
       ;;
@@ -144,10 +147,11 @@ if [ "$ALL" -eq 1 ]; then
   run_smoke_for_project creepy_halloween_sonar
   run_smoke_for_project pico2w_lcd_soundboard
   run_smoke_for_project pico_lcd_generative_art
+  run_smoke_for_project pico_am_radio
   run_smoke_for_project kitchen_wall_clock
 else
   case "$PROJECT" in
-    creepy_halloween_sonar|pico2w_lcd_soundboard|pico_lcd_generative_art|kitchen_wall_clock)
+    creepy_halloween_sonar|pico2w_lcd_soundboard|pico_lcd_generative_art|pico_am_radio|kitchen_wall_clock)
       run_smoke_for_project "$PROJECT"
       ;;
     *)
