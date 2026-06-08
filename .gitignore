@@ -1,5 +1,0 @@
-.DS_Store
-.build/
-*.swp
-*~
-projects/kitchen_wall_clock/src/config_local.h
