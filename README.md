@@ -22,7 +22,13 @@ Pin 1 is also the easiest to identify at a glance — no counting needed.
 
 ---
 
+
 ## Hardware
+
+[!WARNING]
+Monophonic only — one note at a time.
+This transmitter works by rapidly toggling GP0 on and off at each note’s frequency. Because there is only one pin, it can only produce one pitch at any given moment. MIDI files with chords, harmonies, or overlapping notes (polyphony) will not play correctly — simultaneous notes will be collapsed and only one voice will be heard. Use a single-melody, monophonic MIDI file with no overlapping notes. If your MIDI sounds garbled or skips notes, open it in a free tool such as MuseScore or LMMS and export only the melody track as a new type-0 MIDI file.
+
 
 | You need | Notes |
 |---|---|
