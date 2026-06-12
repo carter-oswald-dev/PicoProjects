@@ -77,6 +77,9 @@ def build_page(status_msg="", error_msg=""):
     status_block = f'<p class="status-msg">{status_msg}</p>' if status_msg else ""
     error_block  = f'<p class="error-msg">{error_msg}</p>'  if error_msg  else ""
 
+    warn_block = '<div class="warn-box">&#9888; <strong>Stop transmission before changing frequency.</strong> The carrier frequency cannot be changed mid-transmission &mdash; stop first, then adjust, then start again.</div>' if playing else ""
+    freq_stop_hint = '&nbsp;|&nbsp; <span style="color:#f87171">Stop transmission to change</span>' if playing else ""
+
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -149,7 +152,7 @@ def build_page(status_msg="", error_msg=""):
   <p class="subtitle">Standalone MIDI transmitter &mdash; GP0 antenna</p>
   <div class="state-badge">{state_text}</div>
 
-  {'<div class="warn-box">⚠ <strong>Stop transmission before changing frequency.</strong> The carrier frequency cannot be changed mid-transmission — stop first, then adjust, then start again.</div>' if playing else ''}
+  {warn_block}
 
   <form method="POST" action="/play">
     <div class="section">
@@ -187,7 +190,7 @@ def build_page(status_msg="", error_msg=""):
       <p class="freq-hint">
         Range: 530 kHz – 1700 kHz (AM broadcast band) &nbsp;|&nbsp; Current: <strong>{freq_khz:.1f} kHz</strong>
         &nbsp;({freq_hz/1_000_000:.3f} MHz)
-        {'&nbsp;|&nbsp; <span style="color:#f87171">Stop transmission to change</span>' if playing else ''}
+        {freq_stop_hint}
       </p>
     </div>
   </form>
