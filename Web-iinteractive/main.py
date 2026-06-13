@@ -215,17 +215,26 @@ def parse_post_body(body_bytes):
     return result
 
 def send_response(conn, body, status="200 OK"):
+    if isinstance(body, str):
+        body = body.encode()
     header = (
-        f"HTTP/1.1 {status}\r\n"
+        "HTTP/1.1 " + status + "\r\n"
         "Content-Type: text/html; charset=utf-8\r\n"
-        f"Content-Length: {len(body)}\r\n"
+        "Content-Length: " + str(len(body)) + "\r\n"
         "Connection: close\r\n\r\n"
     )
-    conn.send(header.encode() + body.encode())
+    conn.send(header.encode())
+    chunk_size = 512
+    pos = 0
+    while pos < len(body):
+        conn.send(body[pos:pos + chunk_size])
+        pos += chunk_size
 
 def send_redirect(conn, location="/"):
     header = (
-        f"HTTP/1.1 302 Found\r\nLocation: {location}\r\nConnection: close\r\n\r\n"
+        "HTTP/1.1 302 Found\r\n"
+        "Location: " + location + "\r\n"
+        "Connection: close\r\n\r\n"
     )
     conn.send(header.encode())
 
@@ -233,7 +242,6 @@ def send_redirect(conn, location="/"):
 def serve():
     addr = socket.getaddrinfo("0.0.0.0", 80)[0][-1]
     srv  = socket.socket()
-    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind(addr)
     srv.listen(2)
     srv.settimeout(0.5)   # non-blocking poll so we don't hang on stop
@@ -249,7 +257,6 @@ def serve():
             continue  # timeout — loop again
 
         try:
-            conn.settimeout(3)
             request = b""
             while b"\r\n\r\n" not in request:
                 chunk = conn.recv(256)
@@ -272,7 +279,7 @@ def serve():
                     pass
 
             # Parse request line
-            first_line = request.split(b"\r\n")[0].decode(errors="replace")
+            first_line = request.split(b"\r\n")[0].decode()
             parts = first_line.split(" ")
             method = parts[0] if parts else "GET"
             path   = parts[1] if len(parts) > 1 else "/"
